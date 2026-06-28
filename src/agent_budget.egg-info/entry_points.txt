@@ -1,0 +1,2 @@
+[console_scripts]
+agent-budget = agent_budget.cli:cli

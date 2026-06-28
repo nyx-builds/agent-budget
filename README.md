@@ -1,0 +1,167 @@
+# agent-budget
+
+Budget management and cost tracking MCP server for autonomous agents.
+
+Set budgets, track costs, get alerts, project spending — designed for AI agents that need to operate within financial constraints.
+
+## Features
+
+- **Budget CRUD** — Create, read, update, delete budgets with periods (daily/weekly/monthly/quarterly/yearly/one-time)
+- **Cost Tracking** — Record costs against budgets with categories, sources, tags, and metadata
+- **Alert Rules** — Configure threshold-based alerts (50%, 80%, 95%, 100%) with severity levels and actions (notify/throttle/halt)
+- **Spending Projections** — Forecast spending based on current burn rate
+- **Analytics** — Breakdown costs by category, source, or daily totals
+- **Budget Hierarchy** — Parent/child budgets with rollup summaries
+- **MCP Server** — Full Model Context Protocol server with 20+ tools
+- **CLI** — Rich terminal interface with Click + Rich
+- **JSON Persistence** — File-based storage, no database required
+
+## Installation
+
+```bash
+pip install agent-budget
+```
+
+Or with uv:
+
+```bash
+uv pip install agent-budget
+```
+
+## Quick Start
+
+### CLI
+
+```bash
+# Create a budget
+agent-budget create --name "API Costs" --limit 500 --period monthly --category api_calls
+
+# Record a cost
+agent-budget cost record <budget_id> --amount 2.50 --source "openai-gpt4" --description "Chat completion"
+
+# Check budget status
+agent-budget show <budget_id>
+
+# List all budgets
+agent-budget list
+
+# Project spending
+agent-budget analyze project <budget_id>
+
+# Breakdown by source
+agent-budget analyze by-source <budget_id>
+```
+
+### MCP Server
+
+```bash
+# Start the MCP server
+agent-budget-server
+```
+
+Or configure in your MCP client:
+
+```json
+{
+  "mcpServers": {
+    "agent-budget": {
+      "command": "python",
+      "args": ["-m", "agent_budget.server"]
+    }
+  }
+}
+```
+
+### Python API
+
+```python
+from agent_budget.engine import BudgetEngine
+from agent_budget.models import BudgetPeriod, CostCategory
+
+engine = BudgetEngine()
+
+# Create a budget
+budget = engine.create_budget(
+    name="API Costs",
+    limit=500.0,
+    period=BudgetPeriod.MONTHLY,
+    category=CostCategory.API_CALLS,
+)
+
+# Record costs
+entry, alerts = engine.record_cost(
+    budget_id=budget.id,
+    amount=2.50,
+    source="openai-gpt4",
+    description="Chat completion",
+)
+
+# Check if budget is on track
+projection = engine.project_spending(budget.id)
+print(f"On track: {projection.on_track}")
+print(f"Projected total: {projection.projected_total}")
+
+# Get cost breakdown
+by_source = engine.get_costs_by_source(budget.id)
+by_category = engine.get_costs_by_category(budget.id)
+```
+
+## MCP Tools
+
+The server exposes 20+ tools:
+
+| Tool | Description |
+|------|-------------|
+| `budget_create` | Create a new budget |
+| `budget_get` | Get budget details |
+| `budget_list` | List budgets with filters |
+| `budget_update` | Update a budget |
+| `budget_delete` | Delete a budget |
+| `budget_pause` | Pause a budget |
+| `budget_resume` | Resume a paused budget |
+| `budget_reset` | Reset budget for new period |
+| `cost_record` | Record a cost against a budget |
+| `cost_list` | List cost entries with filters |
+| `cost_delete` | Delete a cost entry |
+| `analyze_summary` | Get budget summary/summaries |
+| `analyze_project` | Project spending |
+| `analyze_by_category` | Cost breakdown by category |
+| `analyze_by_source` | Cost breakdown by source |
+| `analyze_daily` | Daily spending totals |
+| `alert_add` | Add an alert rule |
+| `alert_check` | Check triggered alerts |
+| `hierarchy_children` | List child budgets |
+| `hierarchy_rollup` | Roll up parent + children |
+
+## Cost Categories
+
+- `compute` — Compute resources (CPU, GPU)
+- `api_calls` — API/service calls
+- `storage` — Storage costs
+- `network` — Bandwidth/transfer costs
+- `licensing` — Software licensing
+- `labor` — Human labor costs
+- `infrastructure` — Infrastructure costs
+- `misc` — Miscellaneous
+
+## Alert Actions
+
+- `notify` — Log the alert (default)
+- `throttle` — Signal that the agent should reduce spending
+- `halt` — Signal that the agent should stop spending
+
+## Architecture
+
+```
+agent_budget/
+├── __init__.py      # Package init
+├── models.py        # Pydantic models (Budget, CostEntry, etc.)
+├── engine.py        # Business logic (BudgetEngine)
+├── store.py         # JSON persistence layer
+├── server.py        # MCP server
+└── cli.py           # Click CLI
+```
+
+## License
+
+MIT
