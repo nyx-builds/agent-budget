@@ -1,3 +1,3 @@
-"""Agent Budget — Budget management and cost tracking for autonomous agents."""
+"""Agent Budget — MCP server + CLI for autonomous agents to manage budgets, track expenses, and control spending."""
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

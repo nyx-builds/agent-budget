@@ -1,20 +1,27 @@
-# agent-budget
+# Agent Budget
 
-Budget management and cost tracking MCP server for autonomous agents.
-
-Set budgets, track costs, get alerts, project spending — designed for AI agents that need to operate within financial constraints.
+MCP server + CLI for autonomous agents to manage budgets, track expenses, control spending, set savings goals, and enforce spending rules.
 
 ## Features
 
-- **Budget CRUD** — Create, read, update, delete budgets with periods (daily/weekly/monthly/quarterly/yearly/one-time)
-- **Cost Tracking** — Record costs against budgets with categories, sources, tags, and metadata
-- **Alert Rules** — Configure threshold-based alerts (50%, 80%, 95%, 100%) with severity levels and actions (notify/throttle/halt)
-- **Spending Projections** — Forecast spending based on current burn rate
-- **Analytics** — Breakdown costs by category, source, or daily totals
-- **Budget Hierarchy** — Parent/child budgets with rollup summaries
-- **MCP Server** — Full Model Context Protocol server with 20+ tools
-- **CLI** — Rich terminal interface with Click + Rich
-- **JSON Persistence** — File-based storage, no database required
+### v0.2.0
+- **Savings Goals** — Track progress toward savings targets with auto-completion
+- **Budget Rollover** — Carry unspent budget forward to the next period
+- **Spending Rules** — Block, warn, or require approval for expenses
+- **Expense Updates** — Modify existing expenses (amount, vendor, receipt, status)
+- **Expense Receipts** — Attach receipt URLs, mark expenses as reimbursable
+- **Alert Threshold Updates** — Customize budget alert thresholds
+- **Deprecation Fixes** — `datetime.utcnow()` → `datetime.now(timezone.utc)`
+
+### v0.1.0
+- **Budget Management** — Create, update, delete budgets with spending limits
+- **Expense Tracking** — Log expenses with categories, tags, and vendor info
+- **Recurring Expenses** — Schedule recurring payments (daily/weekly/monthly/quarterly/yearly)
+- **Budget vs. Actual** — Compare spending against budget limits
+- **Spending Forecasts** — Project future spending based on history
+- **Alert System** — Automatic alerts at configurable thresholds
+- **Multi-Currency** — Support for 15+ currencies
+- **Data Export** — Export to JSON, CSV, or Markdown
 
 ## Installation
 
@@ -33,134 +40,193 @@ uv pip install agent-budget
 ### CLI
 
 ```bash
-# Create a budget
-agent-budget create --name "API Costs" --limit 500 --period monthly --category api_calls
+# Create a monthly budget
+agent-budget budget create "API Costs" --limit 500 --period monthly --category api
 
-# Record a cost
-agent-budget cost record <budget_id> --amount 2.50 --source "openai-gpt4" --description "Chat completion"
+# Create a budget with rollover
+agent-budget budget create "Infrastructure" --limit 1000 --period monthly --rollover --rollover-cap 200
+
+# Log an expense
+agent-budget expense add 25.50 --category api --description "OpenAI GPT-4 call" --vendor "OpenAI"
+
+# Log a reimbursable expense with receipt
+agent-budget expense add 99.00 --category saas --vendor "GitHub" --reimbursable --receipt-url "https://receipts.example.com/gh-001"
+
+# Update an expense
+agent-budget expense update EXP-ABC12345 --amount 125.00 --vendor "AWS"
 
 # Check budget status
-agent-budget show <budget_id>
+agent-budget budget status
 
-# List all budgets
-agent-budget list
+# Process budget rollovers
+agent-budget budget rollover
 
-# Project spending
-agent-budget analyze project <budget_id>
+# Create a savings goal
+agent-budget savings create "Emergency Fund" --target 10000 --target-date 2027-01-01
 
-# Breakdown by source
-agent-budget analyze by-source <budget_id>
+# Contribute to a savings goal
+agent-budget savings contribute SAV-ABC12345 --amount 500 --note "Monthly deposit"
+
+# Withdraw from a savings goal
+agent-budget savings withdraw SAV-ABC12345 --amount 200 --note "Emergency repair"
+
+# Add a spending rule
+agent-budget rule add "API Cap" --category api --action block --threshold-amount 500
+
+# Add an approval rule
+agent-budget rule add "Large Expenses" --category infra --action block --approval-above 100
+
+# Check if an expense would violate rules
+agent-budget rule check --amount 150 --category infra
+
+# Set up a recurring expense
+agent-budget recurring add "AWS Hosting" --amount 99 --category infra --frequency monthly
+
+# Get spending summary
+agent-budget summary --this-month
+
+# Get spending forecast
+agent-budget forecast --months 3
+
+# Check alerts
+agent-budget alerts
+
+# Export data
+agent-budget export --format json
 ```
 
 ### MCP Server
 
+Start the MCP server for integration with AI agents:
+
 ```bash
-# Start the MCP server
-agent-budget-server
+agent-budget serve
 ```
 
-Or configure in your MCP client:
-
-```json
-{
-  "mcpServers": {
-    "agent-budget": {
-      "command": "python",
-      "args": ["-m", "agent_budget.server"]
-    }
-  }
-}
-```
-
-### Python API
+Or use it programmatically:
 
 ```python
-from agent_budget.engine import BudgetEngine
-from agent_budget.models import BudgetPeriod, CostCategory
-
-engine = BudgetEngine()
-
-# Create a budget
-budget = engine.create_budget(
-    name="API Costs",
-    limit=500.0,
-    period=BudgetPeriod.MONTHLY,
-    category=CostCategory.API_CALLS,
-)
-
-# Record costs
-entry, alerts = engine.record_cost(
-    budget_id=budget.id,
-    amount=2.50,
-    source="openai-gpt4",
-    description="Chat completion",
-)
-
-# Check if budget is on track
-projection = engine.project_spending(budget.id)
-print(f"On track: {projection.on_track}")
-print(f"Projected total: {projection.projected_total}")
-
-# Get cost breakdown
-by_source = engine.get_costs_by_source(budget.id)
-by_category = engine.get_costs_by_category(budget.id)
+from agent_budget.mcp_server import mcp
+mcp.run()
 ```
 
 ## MCP Tools
 
-The server exposes 20+ tools:
+### Budget Tools
+- `create_budget` — Create a new budget
+- `list_budgets` — List all budgets
+- `get_budget` — Get budget details
+- `update_budget` — Update a budget's settings
+- `delete_budget` — Delete a budget
+- `process_budget_rollover` — Carry unspent budget forward
+- `get_budget_status` — Check actual vs. budgeted spending
+- `compare_budget_actual` — Detailed budget comparison
+- `update_alert_thresholds` — Customize alert thresholds
 
-| Tool | Description |
-|------|-------------|
-| `budget_create` | Create a new budget |
-| `budget_get` | Get budget details |
-| `budget_list` | List budgets with filters |
-| `budget_update` | Update a budget |
-| `budget_delete` | Delete a budget |
-| `budget_pause` | Pause a budget |
-| `budget_resume` | Resume a paused budget |
-| `budget_reset` | Reset budget for new period |
-| `cost_record` | Record a cost against a budget |
-| `cost_list` | List cost entries with filters |
-| `cost_delete` | Delete a cost entry |
-| `analyze_summary` | Get budget summary/summaries |
-| `analyze_project` | Project spending |
-| `analyze_by_category` | Cost breakdown by category |
-| `analyze_by_source` | Cost breakdown by source |
-| `analyze_daily` | Daily spending totals |
-| `alert_add` | Add an alert rule |
-| `alert_check` | Check triggered alerts |
-| `hierarchy_children` | List child budgets |
-| `hierarchy_rollup` | Roll up parent + children |
+### Expense Tools
+- `add_expense` — Log a new expense
+- `update_expense` — Update an existing expense
+- `list_expenses` — List expenses with filters (category, vendor, reimbursable, etc.)
+- `get_expense` — Get expense details
+- `delete_expense` — Delete an expense
 
-## Cost Categories
+### Savings Goal Tools
+- `create_savings_goal` — Create a savings target
+- `list_savings_goals` — List savings goals
+- `get_savings_goal` — Get goal details with progress
+- `contribute_to_savings` — Add a contribution
+- `withdraw_from_savings` — Withdraw from a goal
+- `update_savings_goal` — Update a goal
+- `delete_savings_goal` — Delete a goal
 
-- `compute` — Compute resources (CPU, GPU)
-- `api_calls` — API/service calls
-- `storage` — Storage costs
-- `network` — Bandwidth/transfer costs
-- `licensing` — Software licensing
-- `labor` — Human labor costs
-- `infrastructure` — Infrastructure costs
-- `misc` — Miscellaneous
+### Spending Rule Tools
+- `create_spending_rule` — Create a spending control rule
+- `list_spending_rules` — List spending rules
+- `check_expense_rules` — Check if an expense would violate rules
+- `update_spending_rule` — Update a rule
+- `delete_spending_rule` — Delete a rule
 
-## Alert Actions
+### Recurring Expense Tools
+- `add_recurring_expense` — Set up a recurring expense
+- `list_recurring_expenses` — List recurring templates
+- `process_recurring_expenses` — Generate expenses from due templates
 
-- `notify` — Log the alert (default)
-- `throttle` — Signal that the agent should reduce spending
-- `halt` — Signal that the agent should stop spending
+### Analysis Tools
+- `get_spending_forecast` — Project future spending
+- `get_spending_summary` — Spending by category
+- `get_alerts` — Check budget alerts
+- `clear_alerts` — Clear alerts
+- `export_data` — Export all data
+- `list_currencies` — List supported currencies
 
-## Architecture
+## Python API
 
+```python
+from agent_budget.service import BudgetService
+from agent_budget.store import BudgetStore
+from agent_budget.models import BudgetPeriod, RecurringFrequency, SpendingRuleAction
+
+# Initialize
+svc = BudgetService(BudgetStore())
+
+# Create a budget with rollover
+budget = svc.create_budget(
+    name="API Costs",
+    limit=500,
+    period=BudgetPeriod.MONTHLY,
+    category="api",
+    rollover_enabled=True,
+    rollover_cap=100,
+)
+
+# Add an expense
+expense = svc.add_expense(
+    amount=25.50,
+    category="api",
+    description="OpenAI GPT-4 call",
+    vendor="OpenAI",
+    budget_id=budget.id,
+)
+
+# Update an expense
+svc.update_expense(expense.id, amount=30.00, receipt_url="https://receipt.example.com/123")
+
+# Create a savings goal
+goal = svc.create_savings_goal(
+    name="Emergency Fund",
+    target_amount=10000,
+    target_date=date(2027, 1, 1),
+)
+
+# Contribute to the goal
+goal = svc.contribute_to_savings(goal.id, amount=500, note="Monthly deposit")
+
+# Create a spending rule
+rule = svc.create_spending_rule(
+    name="API Cap",
+    category="api",
+    action=SpendingRuleAction.BLOCK,
+    threshold_amount=500,
+)
+
+# Check budget status
+status = svc.get_budget_status(budget.id)
+print(f"Used {status.percent_used}% of budget")
+
+# Process budget rollovers
+results = svc.process_all_rollovers()
+
+# Get spending forecast
+forecasts = svc.get_spending_forecast(months=3)
 ```
-agent_budget/
-├── __init__.py      # Package init
-├── models.py        # Pydantic models (Budget, CostEntry, etc.)
-├── engine.py        # Business logic (BudgetEngine)
-├── store.py         # JSON persistence layer
-├── server.py        # MCP server
-└── cli.py           # Click CLI
-```
+
+## Data Storage
+
+All data is stored in JSON files under `~/.agent-budget/` (or the directory specified by the `AGENT_BUDGET_DIR` environment variable). No external database required.
+
+## Supported Currencies
+
+USD, EUR, GBP, JPY, CAD, AUD, CHF, CNY, INR, BRL, KRW, MXN, SGD, SEK, NZD
 
 ## License
 

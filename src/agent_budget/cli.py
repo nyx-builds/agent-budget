@@ -1,506 +1,884 @@
-"""Click CLI for agent-budget."""
+"""Click CLI for Agent Budget."""
 
 from __future__ import annotations
 
-import json
-from datetime import datetime, date
+import sys
+from datetime import date, timedelta
 from typing import Optional
 
 import click
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
-from rich import box
+from rich.progress import Progress, BarColumn, TextColumn
 
-from .models import BudgetPeriod, BudgetStatus, CostCategory, AlertSeverity, AlertAction
-from .engine import BudgetEngine
+from .models import (
+    BudgetPeriod, RecurringFrequency, AlertLevel, AlertThreshold,
+    SpendingRuleAction, SavingsGoalStatus,
+    SUPPORTED_CURRENCIES, format_currency,
+)
+from .service import BudgetService
 from .store import BudgetStore
 
-
 console = Console()
-engine = BudgetEngine()
 
 
-def _period_arg(value: str) -> BudgetPeriod:
-    try:
-        return BudgetPeriod(value)
-    except ValueError:
-        raise click.BadParameter(f"Invalid period. Choose from: {', '.join(p.value for p in BudgetPeriod)}")
+def get_service() -> BudgetService:
+    return BudgetService(BudgetStore())
 
 
-def _category_arg(value: str) -> CostCategory:
-    try:
-        return CostCategory(value)
-    except ValueError:
-        raise click.BadParameter(f"Invalid category. Choose from: {', '.join(c.value for c in CostCategory)}")
-
-
-def _status_arg(value: str) -> BudgetStatus:
-    try:
-        return BudgetStatus(value)
-    except ValueError:
-        raise click.BadParameter(f"Invalid status. Choose from: {', '.join(s.value for s in BudgetStatus)}")
-
-
-# ── Budget Commands ────────────────────────────────────────────────────────
+# --- Budget Commands ---
 
 @click.group()
-def cli():
-    """Agent Budget — Budget management and cost tracking for autonomous agents."""
+def main():
+    """Agent Budget — Budget tracking & expense management for autonomous agents."""
     pass
 
 
-@cli.command("create")
-@click.option("--name", "-n", required=True, help="Budget name")
-@click.option("--limit", "-l", required=True, type=float, help="Budget limit")
-@click.option("--period", "-p", default="monthly", help="Budget period (daily/weekly/monthly/quarterly/yearly/one_time)")
-@click.option("--category", "-c", default="misc", help="Cost category")
-@click.option("--currency", default="USD", help="Currency code (3 letters)")
-@click.option("--description", "-d", default=None, help="Description")
-@click.option("--start-date", default=None, help="Start date (YYYY-MM-DD)")
-@click.option("--end-date", default=None, help="End date (YYYY-MM-DD)")
-@click.option("--parent", default=None, help="Parent budget ID")
-@click.option("--tags", default=None, help="Comma-separated tags")
-def create_budget(name, limit, period, category, currency, description, start_date, end_date, parent, tags):
+@main.group("budget")
+def budget_group():
+    """Manage budgets."""
+    pass
+
+
+@budget_group.command("create")
+@click.argument("name")
+@click.option("--limit", required=True, type=float, help="Spending limit for the period")
+@click.option("--period", required=True, type=click.Choice([p.value for p in BudgetPeriod]), help="Budget period")
+@click.option("--category", default=None, help="Category this budget applies to")
+@click.option("--currency", default="USD", help="Currency code")
+@click.option("--rollover/--no-rollover", default=False, help="Enable budget rollover")
+@click.option("--rollover-cap", default=None, type=float, help="Max amount that can roll over")
+def budget_create(name: str, limit: float, period: str, category: Optional[str], currency: str, rollover: bool, rollover_cap: Optional[float]):
     """Create a new budget."""
-    budget = engine.create_budget(
+    svc = get_service()
+    budget = svc.create_budget(
         name=name,
         limit=limit,
-        period=_period_arg(period),
-        category=_category_arg(category),
+        period=BudgetPeriod(period),
+        category=category,
         currency=currency,
-        description=description,
-        start_date=date.fromisoformat(start_date) if start_date else None,
-        end_date=date.fromisoformat(end_date) if end_date else None,
-        parent_budget_id=parent,
-        tags=[t.strip() for t in tags.split(",")] if tags else [],
+        rollover_enabled=rollover,
+        rollover_cap=rollover_cap,
     )
-    console.print(Panel(f"[green]Budget created:[/green] {budget.name}", subtitle=f"ID: {budget.id}"))
-    _print_budget_table([budget])
+    ro_text = ""
+    if rollover:
+        ro_text = f"\n  Rollover: [green]Enabled[/green]" + (f" (cap: {format_currency(rollover_cap, currency)})" if rollover_cap else "")
+    console.print(Panel(
+        f"[green]✓ Budget created:[/green] {budget.id}\n"
+        f"  Name: {budget.name}\n"
+        f"  Limit: {format_currency(budget.limit, budget.currency)}\n"
+        f"  Period: {budget.period.value}\n"
+        f"  Category: {budget.category or 'All'}{ro_text}",
+        title="Budget Created",
+    ))
 
 
-@cli.command("list")
-@click.option("--status", "-s", default=None, help="Filter by status")
-@click.option("--category", "-c", default=None, help="Filter by category")
-def list_budgets(status, category):
+@budget_group.command("list")
+@click.option("--all", "show_all", is_flag=True, help="Show inactive budgets too")
+def budget_list(show_all: bool):
     """List all budgets."""
-    budgets = engine.list_budgets(
-        status=_status_arg(status) if status else None,
-        category=_category_arg(category) if category else None,
-    )
+    svc = get_service()
+    budgets = svc.list_budgets(active_only=not show_all)
     if not budgets:
         console.print("[yellow]No budgets found.[/yellow]")
         return
-    _print_budget_table(budgets)
-
-
-@cli.command("show")
-@click.argument("budget_id")
-def show_budget(budget_id):
-    """Show budget details."""
-    budget = engine.get_budget(budget_id)
-    if not budget:
-        console.print(f"[red]Budget '{budget_id}' not found.[/red]")
-        return
-    summary = engine.get_budget_summary(budget_id)
-    _print_budget_detail(budget, summary)
-
-
-@cli.command("update")
-@click.argument("budget_id")
-@click.option("--name", "-n", default=None, help="New name")
-@click.option("--limit", "-l", default=None, type=float, help="New limit")
-@click.option("--description", "-d", default=None, help="New description")
-@click.option("--status", "-s", default=None, help="New status")
-def update_budget(budget_id, name, limit, description, status):
-    """Update a budget."""
-    kwargs = {}
-    if name:
-        kwargs["name"] = name
-    if limit is not None:
-        kwargs["limit"] = limit
-    if description is not None:
-        kwargs["description"] = description
-    if status:
-        kwargs["status"] = _status_arg(status)
-    if not kwargs:
-        console.print("[yellow]Nothing to update.[/yellow]")
-        return
-    budget = engine.update_budget(budget_id, **kwargs)
-    if not budget:
-        console.print(f"[red]Budget '{budget_id}' not found.[/red]")
-        return
-    console.print(f"[green]Updated budget:[/green] {budget.name}")
-
-
-@cli.command("delete")
-@click.argument("budget_id")
-@click.confirmation_option(prompt="Delete this budget and all its cost entries?")
-def delete_budget(budget_id):
-    """Delete a budget."""
-    if engine.delete_budget(budget_id):
-        console.print(f"[green]Budget '{budget_id}' deleted.[/green]")
-    else:
-        console.print(f"[red]Budget '{budget_id}' not found.[/red]")
-
-
-@cli.command("pause")
-@click.argument("budget_id")
-def pause_budget(budget_id):
-    """Pause a budget (stop tracking costs)."""
-    budget = engine.pause_budget(budget_id)
-    if budget:
-        console.print(f"[yellow]Budget '{budget.name}' paused.[/yellow]")
-    else:
-        console.print(f"[red]Budget '{budget_id}' not found.[/red]")
-
-
-@cli.command("resume")
-@click.argument("budget_id")
-def resume_budget(budget_id):
-    """Resume a paused budget."""
-    budget = engine.resume_budget(budget_id)
-    if budget:
-        console.print(f"[green]Budget '{budget.name}' resumed (status: {budget.status.value}).[/green]")
-    else:
-        console.print(f"[red]Budget '{budget_id}' not found.[/red]")
-
-
-@cli.command("reset")
-@click.argument("budget_id")
-def reset_budget(budget_id):
-    """Reset budget for a new period."""
-    budget = engine.reset_budget_period(budget_id)
-    if budget:
-        console.print(f"[green]Budget '{budget.name}' reset for new period.[/green]")
-    else:
-        console.print(f"[red]Budget '{budget_id}' not found.[/red]")
-
-
-# ── Cost Commands ──────────────────────────────────────────────────────────
-
-@cli.group("cost")
-def cost_group():
-    """Manage cost entries."""
-    pass
-
-
-@cost_group.command("record")
-@click.argument("budget_id")
-@click.option("--amount", "-a", required=True, type=float, help="Cost amount")
-@click.option("--category", "-c", default=None, help="Cost category")
-@click.option("--source", "-s", default=None, help="Cost source (e.g., 'openai-gpt4')")
-@click.option("--description", "-d", default=None, help="Description")
-@click.option("--tags", default=None, help="Comma-separated tags")
-def record_cost(budget_id, amount, category, source, description, tags):
-    """Record a cost against a budget."""
-    try:
-        entry, alerts = engine.record_cost(
-            budget_id=budget_id,
-            amount=amount,
-            category=_category_arg(category) if category else None,
-            source=source,
-            description=description,
-            tags=[t.strip() for t in tags.split(",")] if tags else [],
-        )
-        console.print(f"[green]Cost recorded:[/green] {entry.amount} {entry.currency} → {entry.budget_id}")
-        if alerts:
-            for alert in alerts:
-                color = {"info": "blue", "warning": "yellow", "critical": "red"}[alert["severity"]]
-                console.print(f"  [{color}]ALERT ({alert['severity']}):[/{color}] {alert['message']} ({alert['current_pct']}% used)")
-    except ValueError as e:
-        console.print(f"[red]Error:[/red] {e}")
-
-
-@cost_group.command("list")
-@click.argument("budget_id")
-@click.option("--category", "-c", default=None, help="Filter by category")
-@click.option("--source", "-s", default=None, help="Filter by source")
-@click.option("--start-date", default=None, help="Start date filter (YYYY-MM-DD)")
-@click.option("--end-date", default=None, help="End date filter (YYYY-MM-DD)")
-def list_costs(budget_id, category, source, start_date, end_date):
-    """List cost entries for a budget."""
-    entries = engine.get_cost_entries(
-        budget_id=budget_id,
-        category=_category_arg(category) if category else None,
-        source=source,
-        start_date=datetime.fromisoformat(start_date) if start_date else None,
-        end_date=datetime.fromisoformat(end_date) if end_date else None,
-    )
-    if not entries:
-        console.print("[yellow]No cost entries found.[/yellow]")
-        return
-    table = Table(title="Cost Entries", box=box.ROUNDED)
-    table.add_column("ID", style="dim")
-    table.add_column("Amount", justify="right", style="green")
-    table.add_column("Category", style="cyan")
-    table.add_column("Source", style="magenta")
-    table.add_column("Description")
-    table.add_column("Timestamp", style="dim")
-    for e in entries:
-        table.add_row(e.id, f"{e.amount:.2f} {e.currency}", e.category.value, e.source or "-", e.description or "-", e.timestamp.strftime("%Y-%m-%d %H:%M"))
-    console.print(table)
-
-
-@cost_group.command("delete")
-@click.argument("budget_id")
-@click.argument("entry_id")
-def delete_cost(budget_id, entry_id):
-    """Delete a cost entry."""
-    if engine.delete_cost_entry(budget_id, entry_id):
-        console.print(f"[green]Cost entry '{entry_id}' deleted.[/green]")
-    else:
-        console.print(f"[red]Cost entry '{entry_id}' not found.[/red]")
-
-
-# ── Analytics Commands ────────────────────────────────────────────────────
-
-@cli.group("analyze")
-def analyze_group():
-    """Analyze budgets and spending."""
-    pass
-
-
-@analyze_group.command("summary")
-@click.argument("budget_id", required=False)
-def analyze_summary(budget_id):
-    """Show budget summary. If no budget_id, show all."""
-    if budget_id:
-        summary = engine.get_budget_summary(budget_id)
-        if not summary:
-            console.print(f"[red]Budget '{budget_id}' not found.[/red]")
-            return
-        _print_summary_table([summary])
-    else:
-        summaries = engine.get_all_summaries()
-        if not summaries:
-            console.print("[yellow]No budgets found.[/yellow]")
-            return
-        _print_summary_table(summaries)
-
-
-@analyze_group.command("project")
-@click.argument("budget_id")
-def analyze_project(budget_id):
-    """Project spending for a budget."""
-    proj = engine.project_spending(budget_id)
-    if not proj:
-        console.print(f"[red]Cannot project spending for budget '{budget_id}'.[/red]")
-        return
-    color = "green" if proj.on_track else "red"
-    console.print(Panel(
-        f"[bold]Projected Total:[/bold] {proj.projected_total:.2f} | "
-        f"[bold]Burn Rate:[/bold] {proj.daily_burn_rate:.2f}/day | "
-        f"[bold]On Track:[/bold] [{color}]{proj.on_track}[/{color}]",
-        title=f"Spending Projection — {proj.budget_name}",
-    ))
-
-
-@analyze_group.command("by-category")
-@click.argument("budget_id")
-def analyze_by_category(budget_id):
-    """Breakdown costs by category."""
-    by_cat = engine.get_costs_by_category(budget_id)
-    if not by_cat:
-        console.print("[yellow]No cost entries found.[/yellow]")
-        return
-    table = Table(title="Costs by Category", box=box.ROUNDED)
-    table.add_column("Category", style="cyan")
-    table.add_column("Total", justify="right", style="green")
-    for cat, total in sorted(by_cat.items(), key=lambda x: x[1], reverse=True):
-        table.add_row(cat, f"{total:.2f}")
-    console.print(table)
-
-
-@analyze_group.command("by-source")
-@click.argument("budget_id")
-def analyze_by_source(budget_id):
-    """Breakdown costs by source."""
-    by_src = engine.get_costs_by_source(budget_id)
-    if not by_src:
-        console.print("[yellow]No cost entries found.[/yellow]")
-        return
-    table = Table(title="Costs by Source", box=box.ROUNDED)
-    table.add_column("Source", style="magenta")
-    table.add_column("Total", justify="right", style="green")
-    for src, total in sorted(by_src.items(), key=lambda x: x[1], reverse=True):
-        table.add_row(src, f"{total:.2f}")
-    console.print(table)
-
-
-@analyze_group.command("daily")
-@click.argument("budget_id")
-@click.option("--days", "-d", default=30, help="Number of days to show")
-def analyze_daily(budget_id, days):
-    """Show daily spending totals."""
-    daily = engine.get_daily_spending(budget_id, days)
-    if not daily:
-        console.print("[yellow]No spending data found.[/yellow]")
-        return
-    table = Table(title=f"Daily Spending (Last {days} days)", box=box.ROUNDED)
-    table.add_column("Date", style="cyan")
-    table.add_column("Spent", justify="right", style="green")
-    for d, total in sorted(daily.items()):
-        table.add_row(d, f"{total:.2f}")
-    console.print(table)
-
-
-# ── Alert Commands ─────────────────────────────────────────────────────────
-
-@cli.group("alert")
-def alert_group():
-    """Manage budget alerts."""
-    pass
-
-
-@alert_group.command("add")
-@click.argument("budget_id")
-@click.option("--threshold", "-t", required=True, type=float, help="Threshold percentage (0-100)")
-@click.option("--severity", "-s", default="warning", help="Severity (info/warning/critical)")
-@click.option("--action", "-a", default="notify", help="Action (notify/throttle/halt)")
-@click.option("--message", "-m", default=None, help="Custom alert message")
-def add_alert(budget_id, threshold, severity, action, message):
-    """Add an alert rule to a budget."""
-    budget = engine.add_alert_rule(
-        budget_id=budget_id,
-        threshold_pct=threshold,
-        severity=AlertSeverity(severity),
-        action=AlertAction(action),
-        message=message,
-    )
-    if budget:
-        console.print(f"[green]Alert rule added to budget '{budget.name}'[/green]")
-    else:
-        console.print(f"[red]Budget '{budget_id}' not found.[/red]")
-
-
-@alert_group.command("check")
-@click.argument("budget_id", required=False)
-def check_alerts(budget_id):
-    """Check alerts for a budget or all budgets."""
-    if budget_id:
-        alerts = engine.check_budget_alerts(budget_id)
-    else:
-        alerts = engine.check_all_alerts()
-    if not alerts:
-        console.print("[green]No alerts triggered.[/green]")
-        return
-    table = Table(title="Triggered Alerts", box=box.ROUNDED)
-    table.add_column("Budget", style="cyan")
-    table.add_column("Threshold", justify="right")
-    table.add_column("Current %", justify="right")
-    table.add_column("Severity", style="yellow")
-    table.add_column("Action", style="magenta")
-    table.add_column("Message")
-    for a in alerts:
-        table.add_row(
-            a["budget_name"], f"{a['threshold_pct']}%", f"{a['current_pct']}%",
-            a["severity"], a["action"], a["message"],
-        )
-    console.print(table)
-
-
-# ── Hierarchy Commands ─────────────────────────────────────────────────────
-
-@cli.group("hierarchy")
-def hierarchy_group():
-    """Manage budget hierarchies."""
-    pass
-
-
-@hierarchy_group.command("children")
-@click.argument("parent_budget_id")
-def list_children(parent_budget_id):
-    """List child budgets of a parent."""
-    children = engine.get_sub_budgets(parent_budget_id)
-    if not children:
-        console.print("[yellow]No child budgets found.[/yellow]")
-        return
-    _print_budget_table(children)
-
-
-@hierarchy_group.command("rollup")
-@click.argument("parent_budget_id")
-def rollup(parent_budget_id):
-    """Roll up spending across parent and children."""
-    result = engine.get_rollup_summary(parent_budget_id)
-    if not result:
-        console.print(f"[red]Budget '{parent_budget_id}' not found.[/red]")
-        return
-    console.print(Panel(
-        f"[bold]Total Limit:[/bold] {result['total_limit']:.2f} | "
-        f"[bold]Total Spent:[/bold] {result['total_spent']:.2f} | "
-        f"[bold]Remaining:[/bold] {result['total_remaining']:.2f} | "
-        f"[bold]Utilization:[/bold] {result['utilization_pct']}% | "
-        f"[bold]Children:[/bold] {result['child_count']}",
-        title=f"Rollup — {result['parent_name']}",
-    ))
-
-
-# ── Display Helpers ────────────────────────────────────────────────────────
-
-def _print_budget_table(budgets):
-    table = Table(title="Budgets", box=box.ROUNDED)
-    table.add_column("ID", style="dim")
+    table = Table(title="Budgets")
+    table.add_column("ID", style="cyan")
     table.add_column("Name", style="bold")
-    table.add_column("Limit", justify="right", style="green")
-    table.add_column("Spent", justify="right", style="yellow")
-    table.add_column("Remaining", justify="right", style="cyan")
-    table.add_column("Used %", justify="right")
-    table.add_column("Status")
+    table.add_column("Limit", justify="right")
+    table.add_column("Rollover", justify="right")
     table.add_column("Period")
+    table.add_column("Category")
+    table.add_column("Currency")
+    table.add_column("Status")
     for b in budgets:
-        status_color = {
-            "active": "green", "paused": "yellow", "exceeded": "red",
-            "expired": "dim", "closed": "dim",
-        }.get(b.status.value, "white")
+        status = "[green]Active[/green]" if b.active else "[dim]Inactive[/dim]"
+        ro = f"+{format_currency(b.current_rollover, b.currency)}" if b.rollover_enabled and b.current_rollover > 0 else ("✓" if b.rollover_enabled else "-")
+        table.add_row(b.id, b.name, format_currency(b.limit, b.currency), ro, b.period.value, b.category or "-", b.currency, status)
+    console.print(table)
+
+
+@budget_group.command("status")
+@click.option("--budget-id", default=None, help="Specific budget ID")
+def budget_status(budget_id: Optional[str]):
+    """Check budget status (actual vs. budgeted)."""
+    svc = get_service()
+    if budget_id:
+        comparisons = [svc.get_budget_status(budget_id)]
+    else:
+        comparisons = svc.get_all_budget_status()
+    if not comparisons:
+        console.print("[yellow]No active budgets.[/yellow]")
+        return
+    table = Table(title="Budget Status")
+    table.add_column("Budget", style="bold")
+    table.add_column("Limit", justify="right")
+    table.add_column("Rollover", justify="right")
+    table.add_column("Effective", justify="right")
+    table.add_column("Spent", justify="right")
+    table.add_column("Remaining", justify="right")
+    table.add_column("% Used", justify="right")
+    table.add_column("Status")
+    for c in comparisons:
+        if c.status == "critical":
+            status = f"[red]{c.status.upper()}[/red]"
+        elif c.status == "over":
+            status = f"[yellow]{c.status}[/yellow]"
+        elif c.status == "on_track":
+            status = f"[blue]{c.status}[/blue]"
+        else:
+            status = f"[green]{c.status}[/green]"
+        ro = format_currency(c.rollover_amount) if c.rollover_amount > 0 else "-"
         table.add_row(
-            b.id, b.name, f"{b.limit:.2f} {b.currency}",
-            f"{b.spent:.2f}", f"{b.remaining:.2f}",
-            f"{b.utilization_pct}%", f"[{status_color}]{b.status.value}[/{status_color}]",
-            b.period.value,
+            c.budget_name,
+            format_currency(c.budget_limit),
+            ro,
+            format_currency(c.effective_limit),
+            format_currency(c.actual_spent),
+            format_currency(c.remaining),
+            f"{c.percent_used}%",
+            status,
         )
     console.print(table)
 
 
-def _print_budget_detail(budget, summary):
-    _print_budget_table([budget])
-    if budget.alert_rules:
-        table = Table(title="Alert Rules", box=box.ROUNDED)
-        table.add_column("ID", style="dim")
-        table.add_column("Threshold", justify="right")
-        table.add_column("Severity")
-        table.add_column("Action")
-        table.add_column("Message")
-        for r in budget.alert_rules:
-            table.add_row(r.id, f"{r.threshold_pct}%", r.severity.value, r.action.value, r.message or "-")
-        console.print(table)
+@budget_group.command("update")
+@click.argument("budget_id")
+@click.option("--name", default=None, help="New name")
+@click.option("--limit", default=None, type=float, help="New limit")
+@click.option("--period", default=None, type=click.Choice([p.value for p in BudgetPeriod]), help="New period")
+@click.option("--category", default=None, help="New category")
+@click.option("--active/--inactive", default=None, help="Activate/deactivate")
+@click.option("--rollover/--no-rollover", default=None, help="Enable/disable rollover")
+@click.option("--rollover-cap", default=None, type=float, help="Rollover cap")
+def budget_update(budget_id: str, name: Optional[str], limit: Optional[float], period: Optional[str], category: Optional[str], active: Optional[bool], rollover: Optional[bool], rollover_cap: Optional[float]):
+    """Update a budget."""
+    svc = get_service()
+    budget = svc.update_budget(
+        budget_id=budget_id,
+        name=name,
+        limit=limit,
+        period=BudgetPeriod(period) if period else None,
+        category=category,
+        active=active,
+        rollover_enabled=rollover,
+        rollover_cap=rollover_cap,
+    )
+    console.print(f"[green]✓ Budget {budget.id} updated.[/green]")
 
 
-def _print_summary_table(summaries):
-    table = Table(title="Budget Summaries", box=box.ROUNDED)
-    table.add_column("ID", style="dim")
+@budget_group.command("delete")
+@click.argument("budget_id")
+@click.confirmation_option(prompt="Delete this budget?")
+def budget_delete(budget_id: str):
+    """Delete a budget."""
+    svc = get_service()
+    if svc.delete_budget(budget_id):
+        console.print(f"[green]✓ Budget {budget_id} deleted.[/green]")
+    else:
+        console.print(f"[red]Budget {budget_id} not found.[/red]")
+
+
+@budget_group.command("rollover")
+@click.option("--budget-id", default=None, help="Specific budget ID (default: all)")
+def budget_rollover(budget_id: Optional[str]):
+    """Process budget rollovers (carry unspent budget forward)."""
+    svc = get_service()
+    if budget_id:
+        result = svc.process_budget_rollover(budget_id)
+        if result:
+            console.print(Panel(
+                f"[green]✓ Rollover processed:[/green]\n"
+                f"  Budget: {result.budget_id}\n"
+                f"  From: {result.from_period_start} → {result.from_period_end}\n"
+                f"  To: {result.to_period_start} → {result.to_period_end}\n"
+                f"  Amount rolled over: {format_currency(result.unspent_amount)}",
+                title="Budget Rollover",
+            ))
+        else:
+            console.print("[yellow]No rollover processed (disabled or already processed).[/yellow]")
+    else:
+        results = svc.process_all_rollovers()
+        if results:
+            console.print(f"[green]✓ Processed {len(results)} rollover(s):[/green]")
+            for r in results:
+                console.print(f"  {r.budget_id}: +{format_currency(r.unspent_amount)} from previous period")
+        else:
+            console.print("[yellow]No rollovers to process.[/yellow]")
+
+
+# --- Expense Commands ---
+
+@main.group("expense")
+def expense_group():
+    """Manage expenses."""
+    pass
+
+
+@expense_group.command("add")
+@click.argument("amount", type=float)
+@click.option("--category", required=True, help="Expense category")
+@click.option("--description", default="", help="Description")
+@click.option("--date", "expense_date", default=None, help="Date (YYYY-MM-DD)")
+@click.option("--tags", default="", help="Comma-separated tags")
+@click.option("--currency", default="USD", help="Currency code")
+@click.option("--budget-id", default=None, help="Budget to count against")
+@click.option("--vendor", default=None, help="Vendor or merchant name")
+@click.option("--receipt-url", default=None, help="URL to receipt")
+@click.option("--reimbursable", is_flag=True, help="Mark as reimbursable")
+@click.option("--approved-by", default=None, help="Approver name")
+def expense_add(amount: float, category: str, description: str, expense_date: Optional[str], tags: str, currency: str, budget_id: Optional[str], vendor: Optional[str], receipt_url: Optional[str], reimbursable: bool, approved_by: Optional[str]):
+    """Log a new expense."""
+    svc = get_service()
+    parsed_date = date.fromisoformat(expense_date) if expense_date else None
+    parsed_tags = [t.strip() for t in tags.split(",") if t.strip()] if tags else []
+    try:
+        expense = svc.add_expense(
+            amount=amount,
+            category=category,
+            description=description,
+            expense_date=parsed_date,
+            tags=parsed_tags,
+            currency=currency,
+            budget_id=budget_id,
+            vendor=vendor,
+            receipt_url=receipt_url,
+            reimbursable=reimbursable,
+            approved_by=approved_by,
+        )
+        extras = []
+        if expense.vendor:
+            extras.append(f"  Vendor: {expense.vendor}")
+        if expense.reimbursable:
+            extras.append("  [blue]Reimbursable: Yes[/blue]")
+        if expense.approved_by:
+            extras.append(f"  Approved by: {expense.approved_by}")
+        extra_text = "\n".join(extras)
+        if extra_text:
+            extra_text = "\n" + extra_text
+        console.print(Panel(
+            f"[green]✓ Expense logged:[/green] {expense.id}\n"
+            f"  Amount: {format_currency(expense.amount, expense.currency)}\n"
+            f"  Category: {expense.category}\n"
+            f"  Date: {expense.expense_date}\n"
+            f"  Tags: {', '.join(expense.tags) or '-'}\n"
+            f"  Budget: {expense.budget_id or 'None'}{extra_text}",
+            title="Expense Added",
+        ))
+    except ValueError as e:
+        console.print(f"[red]✗ Expense blocked: {e}[/red]")
+        sys.exit(1)
+
+
+@expense_group.command("update")
+@click.argument("expense_id")
+@click.option("--amount", default=None, type=float, help="New amount")
+@click.option("--category", default=None, help="New category")
+@click.option("--description", default=None, help="New description")
+@click.option("--tags", default=None, help="New tags (comma-separated)")
+@click.option("--status", default=None, type=click.Choice(["planned", "confirmed", "cancelled"]), help="New status")
+@click.option("--vendor", default=None, help="Vendor name")
+@click.option("--receipt-url", default=None, help="Receipt URL")
+@click.option("--reimbursable/--not-reimbursable", default=None, help="Mark as reimbursable")
+@click.option("--approved-by", default=None, help="Approver name")
+def expense_update(expense_id: str, amount: Optional[float], category: Optional[str], description: Optional[str], tags: Optional[str], status: Optional[str], vendor: Optional[str], receipt_url: Optional[str], reimbursable: Optional[bool], approved_by: Optional[str]):
+    """Update an existing expense."""
+    svc = get_service()
+    parsed_tags = [t.strip() for t in tags.split(",") if t.strip()] if tags is not None else None
+    try:
+        expense = svc.update_expense(
+            expense_id=expense_id,
+            amount=amount,
+            category=category,
+            description=description,
+            tags=parsed_tags,
+            status=status,
+            vendor=vendor,
+            receipt_url=receipt_url,
+            reimbursable=reimbursable,
+            approved_by=approved_by,
+        )
+        console.print(f"[green]✓ Expense {expense.id} updated.[/green]")
+    except ValueError as e:
+        console.print(f"[red]✗ {e}[/red]")
+        sys.exit(1)
+
+
+@expense_group.command("list")
+@click.option("--category", default=None, help="Filter by category")
+@click.option("--budget-id", default=None, help="Filter by budget")
+@click.option("--start-date", default=None, help="Start date (YYYY-MM-DD)")
+@click.option("--end-date", default=None, help="End date (YYYY-MM-DD)")
+@click.option("--tags", default="", help="Filter by tags (comma-separated)")
+@click.option("--this-week", is_flag=True, help="Show this week's expenses")
+@click.option("--this-month", is_flag=True, help="Show this month's expenses")
+@click.option("--vendor", default=None, help="Filter by vendor")
+@click.option("--reimbursable", is_flag=True, help="Show only reimbursable expenses")
+def expense_list(category: Optional[str], budget_id: Optional[str], start_date: Optional[str], end_date: Optional[str], tags: str, this_week: bool, this_month: bool, vendor: Optional[str], reimbursable: bool):
+    """List expenses."""
+    svc = get_service()
+    parsed_start = date.fromisoformat(start_date) if start_date else None
+    parsed_end = date.fromisoformat(end_date) if end_date else None
+    parsed_tags = [t.strip() for t in tags.split(",") if t.strip()] if tags else None
+
+    today = date.today()
+    if this_week:
+        parsed_start = today - timedelta(days=today.weekday())
+        parsed_end = today
+    elif this_month:
+        parsed_start = today.replace(day=1)
+        parsed_end = today
+
+    expenses = svc.list_expenses(
+        category=category,
+        budget_id=budget_id,
+        start_date=parsed_start,
+        end_date=parsed_end,
+        tags=parsed_tags,
+        vendor=vendor,
+        reimbursable=reimbursable if reimbursable else None,
+    )
+    if not expenses:
+        console.print("[yellow]No expenses found.[/yellow]")
+        return
+    table = Table(title="Expenses")
+    table.add_column("ID", style="cyan")
+    table.add_column("Date", style="bold")
+    table.add_column("Category")
+    table.add_column("Amount", justify="right")
+    table.add_column("Vendor")
+    table.add_column("Description")
+    table.add_column("Tags")
+    total = 0
+    for e in expenses:
+        table.add_row(
+            e.id,
+            str(e.expense_date),
+            e.category,
+            format_currency(e.amount, e.currency),
+            e.vendor or "-",
+            e.description[:40],
+            ", ".join(e.tags) or "-",
+        )
+        total += e.amount
+    console.print(table)
+    console.print(f"\n[bold]Total: {format_currency(total)}[/bold] ({len(expenses)} expenses)")
+
+
+@expense_group.command("delete")
+@click.argument("expense_id")
+@click.confirmation_option(prompt="Delete this expense?")
+def expense_delete(expense_id: str):
+    """Delete an expense."""
+    svc = get_service()
+    if svc.delete_expense(expense_id):
+        console.print(f"[green]✓ Expense {expense_id} deleted.[/green]")
+    else:
+        console.print(f"[red]Expense {expense_id} not found.[/red]")
+
+
+# --- Savings Commands ---
+
+@main.group("savings")
+def savings_group():
+    """Manage savings goals."""
+    pass
+
+
+@savings_group.command("create")
+@click.argument("name")
+@click.option("--target", required=True, type=float, help="Target amount to save")
+@click.option("--currency", default="USD", help="Currency code")
+@click.option("--target-date", default=None, help="Target date (YYYY-MM-DD)")
+@click.option("--category", default=None, help="Associated budget category")
+@click.option("--description", default="", help="Goal description")
+def savings_create(name: str, target: float, currency: str, target_date: Optional[str], category: Optional[str], description: str):
+    """Create a savings goal."""
+    svc = get_service()
+    parsed_date = date.fromisoformat(target_date) if target_date else None
+    goal = svc.create_savings_goal(
+        name=name,
+        target_amount=target,
+        currency=currency,
+        target_date=parsed_date,
+        category=category,
+        description=description,
+    )
+    console.print(Panel(
+        f"[green]✓ Savings goal created:[/green] {goal.id}\n"
+        f"  Name: {goal.name}\n"
+        f"  Target: {format_currency(goal.target_amount, goal.currency)}\n"
+        f"  Target Date: {goal.target_date or 'No deadline'}\n"
+        f"  Category: {goal.category or '-'}",
+        title="Savings Goal Created",
+    ))
+
+
+@savings_group.command("list")
+@click.option("--status", default=None, type=click.Choice(["active", "completed", "paused"]), help="Filter by status")
+def savings_list(status: Optional[str]):
+    """List savings goals."""
+    svc = get_service()
+    goals = svc.list_savings_goals(status=status)
+    if not goals:
+        console.print("[yellow]No savings goals found.[/yellow]")
+        return
+    table = Table(title="Savings Goals")
+    table.add_column("ID", style="cyan")
+    table.add_column("Name", style="bold")
+    table.add_column("Progress", justify="right")
+    table.add_column("Current", justify="right")
+    table.add_column("Target", justify="right")
+    table.add_column("Remaining", justify="right")
+    table.add_column("Target Date")
+    table.add_column("Status")
+    for g in goals:
+        progress = f"{g.progress_percent:.0f}%"
+        status_color = {"active": "green", "completed": "bold green", "paused": "yellow"}.get(g.status.value, "white")
+        table.add_row(
+            g.id,
+            g.name,
+            progress,
+            format_currency(g.current_amount, g.currency),
+            format_currency(g.target_amount, g.currency),
+            format_currency(g.remaining, g.currency),
+            str(g.target_date) if g.target_date else "-",
+            f"[{status_color}]{g.status.value}[/{status_color}]",
+        )
+    console.print(table)
+
+
+@savings_group.command("contribute")
+@click.argument("goal_id")
+@click.option("--amount", required=True, type=float, help="Amount to contribute")
+@click.option("--note", default="", help="Note about this contribution")
+def savings_contribute(goal_id: str, amount: float, note: str):
+    """Contribute to a savings goal."""
+    svc = get_service()
+    try:
+        goal = svc.contribute_to_savings(goal_id, amount=amount, note=note)
+        bar_filled = int(goal.progress_percent / 10)
+        bar = "█" * bar_filled + "░" * (10 - bar_filled)
+        console.print(Panel(
+            f"[green]✓ Contribution added:[/green] +{format_currency(amount, goal.currency)}\n"
+            f"  Goal: {goal.name}\n"
+            f"  Progress: {bar} {goal.progress_percent:.0f}%\n"
+            f"  Current: {format_currency(goal.current_amount, goal.currency)} / {format_currency(goal.target_amount, goal.currency)}\n"
+            f"  Remaining: {format_currency(goal.remaining, goal.currency)}",
+            title="Savings Contribution",
+        ))
+    except ValueError as e:
+        console.print(f"[red]✗ {e}[/red]")
+        sys.exit(1)
+
+
+@savings_group.command("withdraw")
+@click.argument("goal_id")
+@click.option("--amount", required=True, type=float, help="Amount to withdraw")
+@click.option("--note", default="", help="Note about this withdrawal")
+def savings_withdraw(goal_id: str, amount: float, note: str):
+    """Withdraw from a savings goal."""
+    svc = get_service()
+    try:
+        goal = svc.withdraw_from_savings(goal_id, amount=amount, note=note)
+        console.print(f"[yellow]↩ Withdrew {format_currency(amount, goal.currency)} from {goal.name}.[/yellow]")
+        console.print(f"  Remaining in goal: {format_currency(goal.current_amount, goal.currency)}")
+    except ValueError as e:
+        console.print(f"[red]✗ {e}[/red]")
+        sys.exit(1)
+
+
+@savings_group.command("pause")
+@click.argument("goal_id")
+def savings_pause(goal_id: str):
+    """Pause a savings goal."""
+    svc = get_service()
+    try:
+        goal = svc.pause_savings_goal(goal_id)
+        console.print(f"[yellow]⏸ Savings goal {goal.name} paused.[/yellow]")
+    except ValueError as e:
+        console.print(f"[red]✗ {e}[/red]")
+
+
+@savings_group.command("resume")
+@click.argument("goal_id")
+def savings_resume(goal_id: str):
+    """Resume a paused savings goal."""
+    svc = get_service()
+    try:
+        goal = svc.resume_savings_goal(goal_id)
+        console.print(f"[green]▶ Savings goal {goal.name} resumed.[/green]")
+    except ValueError as e:
+        console.print(f"[red]✗ {e}[/red]")
+
+
+@savings_group.command("delete")
+@click.argument("goal_id")
+@click.confirmation_option(prompt="Delete this savings goal?")
+def savings_delete(goal_id: str):
+    """Delete a savings goal."""
+    svc = get_service()
+    if svc.delete_savings_goal(goal_id):
+        console.print(f"[green]✓ Savings goal {goal_id} deleted.[/green]")
+    else:
+        console.print(f"[red]Savings goal {goal_id} not found.[/red]")
+
+
+# --- Spending Rules Commands ---
+
+@main.group("rule")
+def rule_group():
+    """Manage spending rules."""
+    pass
+
+
+@rule_group.command("add")
+@click.argument("name")
+@click.option("--category", required=True, help="Category this rule applies to")
+@click.option("--action", required=True, type=click.Choice([a.value for a in SpendingRuleAction]), help="Action when triggered")
+@click.option("--threshold-amount", default=None, type=float, help="Max total spending amount")
+@click.option("--threshold-percent", default=None, type=float, help="Max percent of budget")
+@click.option("--budget-id", default=None, help="Associated budget ID")
+@click.option("--approval-above", default=None, type=float, help="Single expenses above this need approval")
+@click.option("--description", default="", help="Rule description")
+def rule_add(name: str, category: str, action: str, threshold_amount: Optional[float], threshold_percent: Optional[float], budget_id: Optional[str], approval_above: Optional[float], description: str):
+    """Add a spending rule."""
+    svc = get_service()
+    rule = svc.create_spending_rule(
+        name=name,
+        category=category,
+        action=SpendingRuleAction(action),
+        threshold_amount=threshold_amount,
+        threshold_percent=threshold_percent,
+        budget_id=budget_id,
+        requires_approval_above=approval_above,
+        description=description,
+    )
+    console.print(Panel(
+        f"[green]✓ Spending rule created:[/green] {rule.id}\n"
+        f"  Name: {rule.name}\n"
+        f"  Category: {rule.category}\n"
+        f"  Action: {rule.action.value}\n"
+        f"  Threshold: {format_currency(rule.threshold_amount) if rule.threshold_amount else (f'{rule.threshold_percent}%' if rule.threshold_percent else 'N/A')}\n"
+        f"  Approval above: {format_currency(rule.requires_approval_above) if rule.requires_approval_above else 'N/A'}",
+        title="Spending Rule Created",
+    ))
+
+
+@rule_group.command("list")
+@click.option("--all", "show_all", is_flag=True, help="Show disabled rules too")
+def rule_list(show_all: bool):
+    """List spending rules."""
+    svc = get_service()
+    rules = svc.list_spending_rules(enabled_only=not show_all)
+    if not rules:
+        console.print("[yellow]No spending rules found.[/yellow]")
+        return
+    table = Table(title="Spending Rules")
+    table.add_column("ID", style="cyan")
     table.add_column("Name", style="bold")
     table.add_column("Category")
-    table.add_column("Limit", justify="right", style="green")
-    table.add_column("Spent", justify="right", style="yellow")
-    table.add_column("Remaining", justify="right", style="cyan")
-    table.add_column("Used %", justify="right")
+    table.add_column("Action")
+    table.add_column("Threshold")
+    table.add_column("Approval Above")
     table.add_column("Status")
-    table.add_column("Alerts", justify="right")
-    for s in summaries:
-        status_color = {
-            "active": "green", "paused": "yellow", "exceeded": "red",
-            "expired": "dim", "closed": "dim",
-        }.get(s.status, "white")
+    for r in rules:
+        thresh = format_currency(r.threshold_amount) if r.threshold_amount else (f"{r.threshold_percent}%" if r.threshold_percent else "-")
+        approval = format_currency(r.requires_approval_above) if r.requires_approval_above else "-"
+        status = "[green]Enabled[/green]" if r.enabled else "[dim]Disabled[/dim]"
+        table.add_row(r.id, r.name, r.category, r.action.value, thresh, approval, status)
+    console.print(table)
+
+
+@rule_group.command("check")
+@click.option("--amount", required=True, type=float, help="Expense amount to check")
+@click.option("--category", required=True, help="Expense category to check")
+def rule_check(amount: float, category: str):
+    """Check if an expense would violate any spending rules."""
+    svc = get_service()
+    from .models import Expense
+    test_expense = Expense(amount=amount, category=category)
+    violations = svc.check_expense_rules(test_expense)
+    if not violations:
+        console.print("[green]✓ No spending rule violations.[/green]")
+    else:
+        console.print("[red]✗ Spending rule violations:[/red]")
+        for v in violations:
+            console.print(f"  • {v}")
+
+
+@rule_group.command("delete")
+@click.argument("rule_id")
+@click.confirmation_option(prompt="Delete this spending rule?")
+def rule_delete(rule_id: str):
+    """Delete a spending rule."""
+    svc = get_service()
+    if svc.delete_spending_rule(rule_id):
+        console.print(f"[green]✓ Spending rule {rule_id} deleted.[/green]")
+    else:
+        console.print(f"[red]Spending rule {rule_id} not found.[/red]")
+
+
+# --- Recurring Commands ---
+
+@main.group("recurring")
+def recurring_group():
+    """Manage recurring expenses."""
+    pass
+
+
+@recurring_group.command("add")
+@click.argument("name")
+@click.option("--amount", required=True, type=float, help="Amount per occurrence")
+@click.option("--category", required=True, help="Expense category")
+@click.option("--frequency", required=True, type=click.Choice([f.value for f in RecurringFrequency]), help="Frequency")
+@click.option("--description", default="", help="Description")
+@click.option("--currency", default="USD", help="Currency code")
+@click.option("--tags", default="", help="Comma-separated tags")
+@click.option("--budget-id", default=None, help="Budget to count against")
+@click.option("--start-date", default=None, help="Start date (YYYY-MM-DD)")
+@click.option("--end-date", default=None, help="End date (YYYY-MM-DD)")
+def recurring_add(name: str, amount: float, category: str, frequency: str, description: str, currency: str, tags: str, budget_id: Optional[str], start_date: Optional[str], end_date: Optional[str]):
+    """Add a recurring expense."""
+    svc = get_service()
+    parsed_start = date.fromisoformat(start_date) if start_date else None
+    parsed_end = date.fromisoformat(end_date) if end_date else None
+    parsed_tags = [t.strip() for t in tags.split(",") if t.strip()] if tags else []
+    recurring = svc.add_recurring_expense(
+        name=name,
+        amount=amount,
+        category=category,
+        frequency=RecurringFrequency(frequency),
+        description=description,
+        currency=currency,
+        tags=parsed_tags,
+        budget_id=budget_id,
+        start_date=parsed_start,
+        end_date=parsed_end,
+    )
+    console.print(Panel(
+        f"[green]✓ Recurring expense created:[/green] {recurring.id}\n"
+        f"  Name: {recurring.name}\n"
+        f"  Amount: {format_currency(recurring.amount, recurring.currency)}\n"
+        f"  Frequency: {recurring.frequency.value}\n"
+        f"  Category: {recurring.category}\n"
+        f"  Next Due: {recurring.next_due}",
+        title="Recurring Expense Added",
+    ))
+
+
+@recurring_group.command("list")
+@click.option("--all", "show_all", is_flag=True, help="Show paused recurring expenses")
+def recurring_list(show_all: bool):
+    """List recurring expenses."""
+    svc = get_service()
+    recurrings = svc.list_recurring_expenses(active_only=not show_all)
+    if not recurrings:
+        console.print("[yellow]No recurring expenses found.[/yellow]")
+        return
+    table = Table(title="Recurring Expenses")
+    table.add_column("ID", style="cyan")
+    table.add_column("Name", style="bold")
+    table.add_column("Amount", justify="right")
+    table.add_column("Frequency")
+    table.add_column("Category")
+    table.add_column("Next Due")
+    table.add_column("Status")
+    for r in recurrings:
+        status = "[green]Active[/green]" if r.active else "[dim]Paused[/dim]"
+        table.add_row(r.id, r.name, format_currency(r.amount, r.currency), r.frequency.value, r.category, str(r.next_due), status)
+    console.print(table)
+
+
+@recurring_group.command("process")
+def recurring_process():
+    """Generate expenses for all due recurring templates."""
+    svc = get_service()
+    generated = svc.process_recurring_expenses()
+    if not generated:
+        console.print("[yellow]No recurring expenses due.[/yellow]")
+        return
+    console.print(f"[green]✓ Generated {len(generated)} expense(s) from recurring templates:[/green]")
+    for e in generated:
+        console.print(f"  {e.id}: {format_currency(e.amount, e.currency)} — {e.description}")
+
+
+@recurring_group.command("pause")
+@click.argument("recurring_id")
+def recurring_pause(recurring_id: str):
+    """Pause a recurring expense."""
+    svc = get_service()
+    recurring = svc.pause_recurring(recurring_id)
+    console.print(f"[yellow]⏸ Recurring expense {recurring.id} paused.[/yellow]")
+
+
+@recurring_group.command("resume")
+@click.argument("recurring_id")
+def recurring_resume(recurring_id: str):
+    """Resume a paused recurring expense."""
+    svc = get_service()
+    recurring = svc.resume_recurring(recurring_id)
+    console.print(f"[green]▶ Recurring expense {recurring.id} resumed.[/green]")
+
+
+@recurring_group.command("delete")
+@click.argument("recurring_id")
+@click.confirmation_option(prompt="Delete this recurring expense?")
+def recurring_delete(recurring_id: str):
+    """Delete a recurring expense."""
+    svc = get_service()
+    if svc.delete_recurring_expense(recurring_id):
+        console.print(f"[green]✓ Recurring expense {recurring_id} deleted.[/green]")
+    else:
+        console.print(f"[red]Recurring expense {recurring_id} not found.[/red]")
+
+
+# --- Analysis Commands ---
+
+@main.command("compare")
+@click.option("--budget-id", default=None, help="Specific budget to compare")
+def compare_budget(budget_id: Optional[str]):
+    """Compare budget vs. actual spending."""
+    svc = get_service()
+    if budget_id:
+        comparisons = [svc.get_budget_status(budget_id)]
+    else:
+        comparisons = svc.get_all_budget_status()
+    if not comparisons:
+        console.print("[yellow]No active budgets to compare.[/yellow]")
+        return
+    table = Table(title="Budget vs. Actual")
+    table.add_column("Budget", style="bold")
+    table.add_column("Category")
+    table.add_column("Limit", justify="right")
+    table.add_column("Rollover", justify="right")
+    table.add_column("Spent", justify="right")
+    table.add_column("Remaining", justify="right")
+    table.add_column("% Used", justify="right")
+    table.add_column("Status")
+    for c in comparisons:
+        status_color = {"critical": "red", "over": "yellow", "on_track": "blue", "under": "green"}.get(c.status, "white")
+        ro = f"+{format_currency(c.rollover_amount)}" if c.rollover_amount > 0 else "-"
         table.add_row(
-            s.budget_id, s.name, s.category,
-            f"{s.limit:.2f} {s.currency}", f"{s.spent:.2f}", f"{s.remaining:.2f}",
-            f"{s.utilization_pct}%", f"[{status_color}]{s.status}[/{status_color}]",
-            str(s.active_alerts),
+            c.budget_name,
+            c.category or "-",
+            format_currency(c.budget_limit),
+            ro,
+            format_currency(c.actual_spent),
+            format_currency(c.remaining),
+            f"{c.percent_used}%",
+            f"[{status_color}]{c.status}[/{status_color}]",
         )
     console.print(table)
+
+
+@main.command("forecast")
+@click.option("--months", default=3, type=int, help="Number of months to forecast")
+@click.option("--category", default=None, help="Filter by category")
+def forecast_cmd(months: int, category: Optional[str]):
+    """Forecast future spending."""
+    svc = get_service()
+    forecasts = svc.get_spending_forecast(months=months, category=category)
+    if not forecasts:
+        console.print("[yellow]No data for forecasting.[/yellow]")
+        return
+    table = Table(title="Spending Forecast")
+    table.add_column("Period", style="bold")
+    table.add_column("Category")
+    table.add_column("Projected", justify="right")
+    table.add_column("Budget Limit", justify="right")
+    table.add_column("Confidence", justify="right")
+    for f in forecasts:
+        over = f.budget_limit and f.projected_spending > f.budget_limit
+        proj = f"[red]{format_currency(f.projected_spending)}[/red]" if over else format_currency(f.projected_spending)
+        table.add_row(
+            f.period,
+            f.category or "-",
+            proj,
+            format_currency(f.budget_limit) if f.budget_limit else "-",
+            f"{f.confidence:.0%}",
+        )
+    console.print(table)
+
+
+@main.command("alerts")
+@click.option("--budget-id", default=None, help="Filter by budget")
+def alerts_cmd(budget_id: Optional[str]):
+    """Check budget alerts."""
+    svc = get_service()
+    alerts = svc.get_alerts(budget_id=budget_id)
+    if not alerts:
+        console.print("[green]No alerts.[/green]")
+        return
+    for a in alerts:
+        level_style = {"info": "blue", "warning": "yellow", "critical": "bold red"}.get(a.level.value, "white")
+        console.print(f"[{level_style}]● {a.level.value.upper()}[/{level_style}] {a.message}")
+
+
+@main.command("summary")
+@click.option("--this-week", is_flag=True, help="This week's summary")
+@click.option("--this-month", is_flag=True, help="This month's summary")
+def summary_cmd(this_week: bool, this_month: bool):
+    """Get spending summary by category."""
+    svc = get_service()
+    today = date.today()
+    start = None
+    end = None
+    if this_week:
+        start = today - timedelta(days=today.weekday())
+        end = today
+    elif this_month:
+        start = today.replace(day=1)
+        end = today
+
+    category_summary = svc.get_category_summary(start_date=start, end_date=end)
+    if not category_summary:
+        console.print("[yellow]No spending data.[/yellow]")
+        return
+    table = Table(title="Spending Summary" + (f" ({start} to {end})" if start else ""))
+    table.add_column("Category", style="bold")
+    table.add_column("Total Spent", justify="right")
+    for cat, total in category_summary.items():
+        table.add_row(cat, format_currency(total))
+    grand = sum(category_summary.values())
+    console.print(table)
+    console.print(f"\n[bold]Grand Total: {format_currency(grand)}[/bold]")
+
+
+# --- Export Command ---
+
+@main.command("export")
+@click.option("--format", "fmt", type=click.Choice(["json", "csv", "markdown"]), default="json", help="Export format")
+def export_cmd(fmt: str):
+    """Export budget and expense data."""
+    svc = get_service()
+    output = svc.export_data(format=fmt)
+    console.print(output)
+
+
+# --- Utility Commands ---
+
+@main.command("currencies")
+def currencies_cmd():
+    """List supported currencies."""
+    table = Table(title="Supported Currencies")
+    table.add_column("Code", style="bold")
+    table.add_column("Name")
+    table.add_column("Symbol")
+    table.add_column("Decimals", justify="right")
+    for c in SUPPORTED_CURRENCIES.values():
+        table.add_row(c.code, c.name, c.symbol, str(c.decimal_places))
+    console.print(table)
+
+
+@main.command("serve")
+def serve_cmd():
+    """Start the MCP server."""
+    from .mcp_server import run_server
+    console.print("[bold green]Starting Agent Budget MCP server...[/bold green]")
+    run_server()
 
 
 if __name__ == "__main__":
-    cli()
+    main()
