@@ -872,6 +872,294 @@ def currencies_cmd():
     console.print(table)
 
 
+# --- v0.3.0: Import Commands ---
+
+@main.command("import")
+@click.argument("file_path")
+@click.option("--category", default=None, help="Default category for expenses without one")
+@click.option("--currency", default="USD", help="Default currency code")
+@click.option("--budget-id", default=None, help="Default budget ID to assign")
+@click.option("--no-dedup", is_flag=True, help="Disable duplicate detection")
+def import_cmd(file_path: str, category: Optional[str], currency: str, budget_id: Optional[str], no_dedup: bool):
+    """Import expenses from a CSV file. Supports columns: date, amount, category, description, vendor, tags, currency."""
+    svc = get_service()
+    try:
+        result = svc.import_csv(
+            file_path=file_path,
+            category=category,
+            currency=currency,
+            budget_id=budget_id,
+            skip_duplicates=not no_dedup,
+        )
+        console.print(Panel(
+            f"[green]✓ Import complete[/green]\n"
+            f"  Total rows: {result.total_rows}\n"
+            f"  Imported: [green]{result.imported}[/green]\n"
+            f"  Skipped: [yellow]{result.skipped}[/yellow]\n"
+            f"  Errors: [red]{len(result.errors)}[/red]\n"
+            f"  Total amount: {format_currency(result.total_amount, currency)}",
+            title="CSV Import Result",
+        ))
+        if result.errors:
+            console.print("[red]Errors:[/red]")
+            for err in result.errors[:10]:
+                console.print(f"  • {err}")
+    except ValueError as e:
+        console.print(f"[red]✗ Import failed: {e}[/red]")
+        sys.exit(1)
+
+
+# --- v0.3.0: Analytics Commands ---
+
+@main.command("trends")
+@click.option("--category", default=None, help="Filter by category")
+@click.option("--period", "period_type", default="monthly", type=click.Choice(["weekly", "monthly", "quarterly"]), help="Period type")
+def trends_cmd(category: Optional[str], period_type: str):
+    """Analyze spending trends (current vs. previous period)."""
+    svc = get_service()
+    trends = svc.get_spending_trends(category=category, period_type=period_type)
+    if not trends:
+        console.print("[yellow]No spending data available for trends.[/yellow]")
+        return
+    table = Table(title=f"Spending Trends ({period_type.capitalize()})")
+    table.add_column("Category", style="bold")
+    table.add_column("Current", justify="right")
+    table.add_column("Previous", justify="right")
+    table.add_column("Change", justify="right")
+    table.add_column("Change %", justify="right")
+    table.add_column("Direction")
+    for t in trends:
+        if t.direction.value == "up":
+            direction = f"[red]↑ {t.direction.value.upper()}[/red]"
+            change = f"[red]+{format_currency(t.change_amount)}[/red]"
+            pct = f"[red]+{t.change_percent:.1f}%[/red]"
+        elif t.direction.value == "down":
+            direction = f"[green]↓ {t.direction.value.upper()}[/green]"
+            change = f"[green]{format_currency(t.change_amount)}[/green]"
+            pct = f"[green]{t.change_percent:.1f}%[/green]"
+        else:
+            direction = f"[blue]→ {t.direction.value.upper()}[/blue]"
+            change = f"{format_currency(t.change_amount)}"
+            pct = f"{t.change_percent:.1f}%"
+        table.add_row(
+            t.category,
+            format_currency(t.current_period_spending),
+            format_currency(t.previous_period_spending),
+            change,
+            pct,
+            direction,
+        )
+    console.print(table)
+    console.print(f"\n[dim]Current period: {trends[0].current_period}[/dim]")
+    console.print(f"[dim]Previous period: {trends[0].previous_period}[/dim]")
+
+
+@main.command("breakdown")
+@click.option("--start-date", default=None, help="Start date (YYYY-MM-DD)")
+@click.option("--end-date", default=None, help="End date (YYYY-MM-DD)")
+@click.option("--top", "top_n", default=10, type=int, help="Number of top categories")
+def breakdown_cmd(start_date: Optional[str], end_date: Optional[str], top_n: int):
+    """Get detailed spending breakdown by category."""
+    svc = get_service()
+    parsed_start = date.fromisoformat(start_date) if start_date else None
+    parsed_end = date.fromisoformat(end_date) if end_date else None
+    breakdowns = svc.get_category_breakdown(start_date=parsed_start, end_date=parsed_end, top_n=top_n)
+    if not breakdowns:
+        console.print("[yellow]No spending data for this period.[/yellow]")
+        return
+    table = Table(title="Spending Breakdown")
+    table.add_column("Category", style="bold")
+    table.add_column("Total", justify="right")
+    table.add_column("Count", justify="right")
+    table.add_column("Average", justify="right")
+    table.add_column("Largest", justify="right")
+    table.add_column("% of Total", justify="right")
+    table.add_column("Top Vendors")
+    for b in breakdowns:
+        vendors = ", ".join(b.vendors[:3]) if b.vendors else "-"
+        table.add_row(
+            b.category,
+            format_currency(b.total),
+            str(b.count),
+            format_currency(b.average),
+            format_currency(b.largest_expense) if b.largest_expense else "-",
+            f"{b.percentage:.1f}%",
+            vendors,
+        )
+    console.print(table)
+
+
+@main.command("compare-periods")
+@click.option("--period-a-start", required=True, help="Start of period A (YYYY-MM-DD)")
+@click.option("--period-a-end", required=True, help="End of period A (YYYY-MM-DD)")
+@click.option("--period-b-start", required=True, help="Start of period B (YYYY-MM-DD)")
+@click.option("--period-b-end", required=True, help="End of period B (YYYY-MM-DD)")
+def compare_periods_cmd(period_a_start: str, period_a_end: str, period_b_start: str, period_b_end: str):
+    """Compare spending between two time periods."""
+    svc = get_service()
+    comparison = svc.compare_periods(
+        period_a_start=date.fromisoformat(period_a_start),
+        period_a_end=date.fromisoformat(period_a_end),
+        period_b_start=date.fromisoformat(period_b_start),
+        period_b_end=date.fromisoformat(period_b_end),
+    )
+    # Overall comparison
+    if comparison.direction.value == "up":
+        direction = f"[red]↑ UP[/red]"
+    elif comparison.direction.value == "down":
+        direction = f"[green]↓ DOWN[/green]"
+    else:
+        direction = f"[blue]→ FLAT[/blue]"
+
+    console.print(Panel(
+        f"Period A ({period_a_start} to {period_a_end}): {format_currency(comparison.period_a_total)}\n"
+        f"Period B ({period_b_start} to {period_b_end}): {format_currency(comparison.period_b_total)}\n"
+        f"Change: {format_currency(comparison.change_amount)} ({comparison.change_percent:+.1f}%) {direction}",
+        title="Period Comparison",
+    ))
+
+    # Category breakdown
+    if comparison.category_trends:
+        table = Table(title="Category Trends")
+        table.add_column("Category", style="bold")
+        table.add_column("Period A", justify="right")
+        table.add_column("Period B", justify="right")
+        table.add_column("Change", justify="right")
+        table.add_column("Direction")
+        for t in comparison.category_trends:
+            if t.direction.value == "up":
+                d = f"[red]↑ {t.change_percent:+.1f}%[/red]"
+            elif t.direction.value == "down":
+                d = f"[green]↓ {t.change_percent:+.1f}%[/green]"
+            else:
+                d = f"[blue]→ {t.change_percent:+.1f}%[/blue]"
+            table.add_row(
+                t.category,
+                format_currency(t.previous_period_spending),
+                format_currency(t.current_period_spending),
+                format_currency(t.change_amount),
+                d,
+            )
+        console.print(table)
+
+
+# --- v0.3.0: Template Commands ---
+
+@main.group("template")
+def template_group():
+    """Manage budget templates."""
+    pass
+
+
+@template_group.command("list")
+@click.option("--category", default=None, help="Filter by category")
+def template_list(category: Optional[str]):
+    """List available budget templates."""
+    svc = get_service()
+    templates = svc.list_budget_templates(category=category)
+    if not templates:
+        console.print("[yellow]No budget templates found.[/yellow]")
+        return
+    table = Table(title="Budget Templates")
+    table.add_column("ID", style="cyan")
+    table.add_column("Name", style="bold")
+    table.add_column("Category")
+    table.add_column("Default Limit", justify="right")
+    table.add_column("Period")
+    table.add_column("Type")
+    table.add_column("Description")
+    for t in templates:
+        ttype = "[blue]Built-in[/blue]" if t.is_builtin else "[green]Custom[/green]"
+        table.add_row(t.id, t.name, t.category, format_currency(t.default_limit, t.currency), t.period.value, ttype, t.description[:50] if t.description else "-")
+    console.print(table)
+
+
+@template_group.command("show")
+@click.argument("template_id")
+def template_show(template_id: str):
+    """Show details of a budget template."""
+    svc = get_service()
+    template = svc.get_budget_template(template_id)
+    if not template:
+        console.print(f"[red]Template {template_id} not found.[/red]")
+        return
+    ttype = "Built-in" if template.is_builtin else "Custom"
+    alerts = "\n".join(f"  {a.percent}% → {a.level.value}" for a in template.suggested_alerts) if template.suggested_alerts else "  (none)"
+    rules = "\n".join(f"  {r.get('name', 'Rule')}: {r.get('action', 'warn')}" for r in template.suggested_rules) if template.suggested_rules else "  (none)"
+    console.print(Panel(
+        f"  Name: {template.name}\n"
+        f"  Category: {template.category}\n"
+        f"  Default Limit: {format_currency(template.default_limit, template.currency)}\n"
+        f"  Period: {template.period.value}\n"
+        f"  Currency: {template.currency}\n"
+        f"  Type: {ttype}\n"
+        f"  Tags: {', '.join(template.tags) or '-'}\n"
+        f"  Description: {template.description or '-'}\n\n"
+        f"  Suggested Alerts:\n{alerts}\n\n"
+        f"  Suggested Rules:\n{rules}",
+        title=f"Budget Template: {template.id}",
+    ))
+
+
+@template_group.command("create")
+@click.argument("name")
+@click.option("--category", required=True, help="Budget category")
+@click.option("--limit", "default_limit", required=True, type=float, help="Default spending limit")
+@click.option("--period", required=True, type=click.Choice([p.value for p in BudgetPeriod]), help="Budget period")
+@click.option("--description", default="", help="Template description")
+@click.option("--currency", default="USD", help="Currency code")
+def template_create(name: str, category: str, default_limit: float, period: str, description: str, currency: str):
+    """Create a custom budget template."""
+    svc = get_service()
+    template = svc.create_budget_template(
+        name=name,
+        category=category,
+        default_limit=default_limit,
+        period=BudgetPeriod(period),
+        description=description,
+        currency=currency,
+    )
+    console.print(Panel(
+        f"[green]✓ Template created:[/green] {template.id}\n"
+        f"  Name: {template.name}\n"
+        f"  Category: {template.category}\n"
+        f"  Default Limit: {format_currency(template.default_limit, template.currency)}\n"
+        f"  Period: {template.period.value}",
+        title="Budget Template Created",
+    ))
+
+
+@template_group.command("use")
+@click.argument("template_id")
+@click.option("--name", default=None, help="Override template name")
+@click.option("--limit", default=None, type=float, help="Override default limit")
+@click.option("--currency", default=None, help="Override currency")
+def template_use(template_id: str, name: Optional[str], limit: Optional[float], currency: Optional[str]):
+    """Create a budget from a template (includes suggested alerts and rules)."""
+    svc = get_service()
+    try:
+        budget = svc.instantiate_budget_template(
+            template_id=template_id,
+            name=name,
+            limit=limit,
+            currency=currency,
+        )
+        template = svc.get_budget_template(template_id)
+        console.print(Panel(
+            f"[green]✓ Budget created from template:[/green] {budget.id}\n"
+            f"  Name: {budget.name}\n"
+            f"  Limit: {format_currency(budget.limit, budget.currency)}\n"
+            f"  Period: {budget.period.value}\n"
+            f"  Category: {budget.category or '-'}\n"
+            f"  Alerts: {len(template.suggested_alerts) if template else 0} configured\n"
+            f"  Rules: {len(template.suggested_rules) if template else 0} created",
+            title="Budget from Template",
+        ))
+    except ValueError as e:
+        console.print(f"[red]✗ {e}[/red]")
+        sys.exit(1)
+
+
 @main.command("serve")
 def serve_cmd():
     """Start the MCP server."""

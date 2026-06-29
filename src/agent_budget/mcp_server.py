@@ -857,6 +857,192 @@ def list_currencies() -> str:
     return json.dumps([c.model_dump() for c in SUPPORTED_CURRENCIES.values()], indent=2)
 
 
+# --- v0.3.0: CSV Import ---
+
+@mcp.tool()
+def import_csv(
+    file_path: str,
+    category: str | None = None,
+    currency: str = "USD",
+    budget_id: str | None = None,
+    skip_duplicates: bool = True,
+) -> str:
+    """Import expenses from a CSV file. Supports common column names (date, amount, category, description, vendor, tags, currency).
+
+    Args:
+        file_path: Path to the CSV file
+        category: Default category for expenses without one
+        currency: Default currency code (default USD)
+        budget_id: Default budget ID to assign
+        skip_duplicates: Skip rows that match existing expenses (default True)
+    """
+    svc = get_service()
+    try:
+        result = svc.import_csv(
+            file_path=file_path,
+            category=category,
+            currency=currency,
+            budget_id=budget_id,
+            skip_duplicates=skip_duplicates,
+        )
+        return json.dumps(result.model_dump(), indent=2)
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
+
+
+# --- v0.3.0: Spending Analytics ---
+
+@mcp.tool()
+def get_spending_trends(
+    category: str | None = None,
+    period_type: str = "monthly",
+) -> str:
+    """Analyze spending trends between current and previous periods.
+
+    Args:
+        category: Filter by specific category (default: all categories)
+        period_type: Period type — 'monthly', 'weekly', or 'quarterly' (default monthly)
+    """
+    svc = get_service()
+    trends = svc.get_spending_trends(category=category, period_type=period_type)
+    return json.dumps([t.model_dump() for t in trends], default=str, indent=2)
+
+
+@mcp.tool()
+def get_category_breakdown(
+    start_date: str | None = None,
+    end_date: str | None = None,
+    top_n: int = 10,
+) -> str:
+    """Get detailed spending breakdown by category with averages, counts, and top vendors.
+
+    Args:
+        start_date: Start date (YYYY-MM-DD, defaults to current month start)
+        end_date: End date (YYYY-MM-DD, defaults to today)
+        top_n: Number of top categories to return (default 10)
+    """
+    svc = get_service()
+    parsed_start = date.fromisoformat(start_date) if start_date else None
+    parsed_end = date.fromisoformat(end_date) if end_date else None
+    breakdown = svc.get_category_breakdown(start_date=parsed_start, end_date=parsed_end, top_n=top_n)
+    return json.dumps([b.model_dump() for b in breakdown], default=str, indent=2)
+
+
+@mcp.tool()
+def compare_periods(
+    period_a_start: str,
+    period_a_end: str,
+    period_b_start: str,
+    period_b_end: str,
+) -> str:
+    """Compare spending between two time periods with per-category trends.
+
+    Args:
+        period_a_start: Start of period A / older period (YYYY-MM-DD)
+        period_a_end: End of period A (YYYY-MM-DD)
+        period_b_start: Start of period B / newer period (YYYY-MM-DD)
+        period_b_end: End of period B (YYYY-MM-DD)
+    """
+    svc = get_service()
+    comparison = svc.compare_periods(
+        period_a_start=date.fromisoformat(period_a_start),
+        period_a_end=date.fromisoformat(period_a_end),
+        period_b_start=date.fromisoformat(period_b_start),
+        period_b_end=date.fromisoformat(period_b_end),
+    )
+    return json.dumps(comparison.model_dump(), default=str, indent=2)
+
+
+# --- v0.3.0: Budget Templates ---
+
+@mcp.tool()
+def list_budget_templates(category: str | None = None) -> str:
+    """List available budget templates (built-in and custom).
+
+    Args:
+        category: Filter by category
+    """
+    svc = get_service()
+    templates = svc.list_budget_templates(category=category)
+    return json.dumps([t.model_dump() for t in templates], default=str, indent=2)
+
+
+@mcp.tool()
+def get_budget_template(template_id: str) -> str:
+    """Get details for a specific budget template.
+
+    Args:
+        template_id: Template ID
+    """
+    svc = get_service()
+    template = svc.get_budget_template(template_id)
+    if not template:
+        return json.dumps({"error": f"Template {template_id} not found"})
+    return json.dumps(template.model_dump(), default=str, indent=2)
+
+
+@mcp.tool()
+def create_budget_template(
+    name: str,
+    category: str,
+    default_limit: float,
+    period: str,
+    description: str = "",
+    currency: str = "USD",
+) -> str:
+    """Create a custom budget template for reuse.
+
+    Args:
+        name: Template name
+        category: Budget category
+        default_limit: Default spending limit
+        period: Budget period (daily, weekly, monthly, quarterly, yearly)
+        description: Template description
+        currency: Currency code (default USD)
+    """
+    svc = get_service()
+    try:
+        template = svc.create_budget_template(
+            name=name,
+            category=category,
+            default_limit=default_limit,
+            period=BudgetPeriod(period),
+            description=description,
+            currency=currency,
+        )
+        return json.dumps(template.model_dump(), default=str, indent=2)
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def instantiate_budget_template(
+    template_id: str,
+    name: str | None = None,
+    limit: float | None = None,
+    currency: str | None = None,
+) -> str:
+    """Create a budget from a template, including suggested alerts and spending rules.
+
+    Args:
+        template_id: Template ID to instantiate
+        name: Override template name (optional)
+        limit: Override template default limit (optional)
+        currency: Override template currency (optional)
+    """
+    svc = get_service()
+    try:
+        budget = svc.instantiate_budget_template(
+            template_id=template_id,
+            name=name,
+            limit=limit,
+            currency=currency,
+        )
+        return json.dumps(budget.model_dump(), default=str, indent=2)
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
+
+
 def run_server():
     """Run the MCP server."""
     mcp.run()

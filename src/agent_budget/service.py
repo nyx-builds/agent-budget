@@ -11,6 +11,8 @@ from .models import (
     SavingsGoal, SavingsGoalStatus, SavingsContribution,
     SpendingRule, SpendingRuleAction,
     SUPPORTED_CURRENCIES,
+    SpendingTrend, TrendDirection, CategoryBreakdown, PeriodComparison,
+    BudgetTemplate, CSVImportResult, BUILTIN_BUDGET_TEMPLATES,
 )
 from .store import BudgetStore
 
@@ -863,3 +865,522 @@ class BudgetService:
     def list_currencies() -> list[dict]:
         """List all supported currencies."""
         return [c.model_dump() for c in SUPPORTED_CURRENCIES.values()]
+
+    # --- v0.3.0: CSV Import ---
+
+    def import_csv(
+        self,
+        file_path: str,
+        category: Optional[str] = None,
+        currency: str = "USD",
+        budget_id: Optional[str] = None,
+        skip_duplicates: bool = True,
+        mapping: Optional[dict] = None,
+    ) -> CSVImportResult:
+        """Import expenses from a CSV file.
+
+        Expected CSV columns (with default mapping):
+          - date/expense_date: Date of the expense (YYYY-MM-DD)
+          - amount: Expense amount
+          - category: Expense category
+          - description/memo: Description
+          - vendor/merchant: Vendor name
+          - tags: Comma-separated tags
+          - currency: Currency code (optional)
+
+        If 'category' column is missing, the provided default category is used.
+        If 'date' column is missing, today's date is used.
+
+        Args:
+            file_path: Path to the CSV file
+            category: Default category for expenses without one
+            currency: Default currency
+            budget_id: Default budget ID
+            skip_duplicates: Skip rows that look like existing expenses
+            mapping: Optional column name mapping {csv_name: model_name}
+        """
+        import csv as csv_module
+
+        result = CSVImportResult(total_rows=0, imported=0, skipped=0)
+
+        # Default column name mappings (CSV name -> model field)
+        default_mapping = {
+            "date": "date",
+            "expense_date": "date",
+            "transaction_date": "date",
+            "amount": "amount",
+            "description": "description",
+            "memo": "description",
+            "note": "description",
+            "category": "category",
+            "cat": "category",
+            "vendor": "vendor",
+            "merchant": "vendor",
+            "payee": "vendor",
+            "tags": "tags",
+            "tag": "tags",
+            "currency": "currency",
+        }
+
+        if mapping:
+            default_mapping.update(mapping)
+
+        try:
+            with open(file_path, "r", newline="", encoding="utf-8") as f:
+                # Try to sniff the dialect
+                sample = f.read(8192)
+                f.seek(0)
+
+                try:
+                    dialect = csv_module.Sniffer().sniff(sample)
+                except csv_module.Error:
+                    dialect = csv_module.excel
+
+                reader = csv_module.DictReader(f, dialect=dialect)
+                rows = list(reader)
+                result.total_rows = len(rows)
+
+                # Normalize headers
+                normalized_rows = []
+                for row in rows:
+                    normalized = {}
+                    for key, value in row.items():
+                        if key is None:
+                            continue
+                        key_lower = key.strip().lower().replace(" ", "_")
+                        mapped_key = default_mapping.get(key_lower, key_lower)
+                        normalized[mapped_key] = value.strip() if isinstance(value, str) else value
+                    normalized_rows.append(normalized)
+
+                # Get existing expenses for duplicate checking
+                existing_expenses = set()
+                if skip_duplicates:
+                    for e in self.store.list_expenses():
+                        key = (round(e.amount, 2), e.category.lower(), str(e.expense_date))
+                        existing_expenses.add(key)
+
+                for row in normalized_rows:
+                    try:
+                        # Parse amount
+                        amount_str = row.get("amount", "").strip()
+                        if not amount_str:
+                            result.skipped += 1
+                            continue
+                        # Handle currency formatting: remove $ € £ etc and commas
+                        amount_str = amount_str.replace(",", "").replace("$", "").replace("€", "").replace("£", "").strip()
+                        if not amount_str:
+                            result.skipped += 1
+                            continue
+                        amount = float(amount_str)
+                        if amount <= 0:
+                            result.skipped += 1
+                            continue
+
+                        # Parse date
+                        date_str = row.get("date", "").strip()
+                        if date_str:
+                            try:
+                                expense_date = date.fromisoformat(date_str)
+                            except ValueError:
+                                # Try common formats
+                                for fmt in ["%m/%d/%Y", "%d/%m/%Y", "%m-%d-%Y", "%d-%m-%Y", "%Y/%m/%d"]:
+                                    try:
+                                        expense_date = datetime.strptime(date_str, fmt).date()
+                                        break
+                                    except ValueError:
+                                        continue
+                                else:
+                                    expense_date = date.today()
+                        else:
+                            expense_date = date.today()
+
+                        # Parse category
+                        row_category = row.get("category", "").strip()
+                        exp_category = row_category or category or "imported"
+
+                        # Parse description
+                        description = row.get("description", "").strip()
+
+                        # Parse vendor
+                        vendor = row.get("vendor", "").strip() or None
+
+                        # Parse tags
+                        tags_str = row.get("tags", "").strip()
+                        tags = [t.strip() for t in tags_str.split(",") if t.strip()] if tags_str else []
+
+                        # Parse currency
+                        row_currency = row.get("currency", "").strip()
+                        exp_currency = row_currency or currency
+
+                        # Duplicate check
+                        if skip_duplicates:
+                            key = (round(amount, 2), exp_category.lower(), str(expense_date))
+                            if key in existing_expenses:
+                                result.skipped += 1
+                                continue
+
+                        # Create the expense
+                        expense = self.add_expense(
+                            amount=amount,
+                            category=exp_category,
+                            description=description,
+                            expense_date=expense_date,
+                            tags=tags,
+                            currency=exp_currency,
+                            budget_id=budget_id,
+                            vendor=vendor,
+                        )
+                        result.imported += 1
+                        result.expense_ids.append(expense.id)
+                        result.total_amount += expense.amount
+
+                        if skip_duplicates:
+                            existing_expenses.add((round(amount, 2), exp_category.lower(), str(expense_date)))
+
+                    except (ValueError, KeyError) as e:
+                        result.errors.append(f"Row {result.imported + result.skipped + len(result.errors) + 1}: {str(e)}")
+                        result.skipped += 1
+
+        except FileNotFoundError:
+            raise ValueError(f"CSV file not found: {file_path}")
+        except Exception as e:
+            raise ValueError(f"Error reading CSV file: {str(e)}")
+
+        return result
+
+    # --- v0.3.0: Spending Analytics ---
+
+    def get_spending_trends(
+        self,
+        category: Optional[str] = None,
+        period_type: str = "monthly",
+    ) -> list[SpendingTrend]:
+        """Analyze spending trends between current and previous periods.
+
+        Args:
+            category: Filter by specific category (None for all categories)
+            period_type: Period type ('monthly', 'weekly', 'quarterly')
+        """
+        today = date.today()
+
+        # Determine period boundaries
+        if period_type == "weekly":
+            current_start = today - timedelta(days=today.weekday())
+            current_end = today
+            prev_start = current_start - timedelta(weeks=1)
+            prev_end = current_start - timedelta(days=1)
+        elif period_type == "quarterly":
+            quarter_start_month = ((today.month - 1) // 3) * 3 + 1
+            current_start = today.replace(month=quarter_start_month, day=1)
+            current_end = today
+            if quarter_start_month <= 3:
+                prev_start = today.replace(year=today.year - 1, month=10, day=1)
+            else:
+                prev_start = today.replace(month=quarter_start_month - 3, day=1)
+            prev_end = current_start - timedelta(days=1)
+        else:  # monthly
+            current_start = today.replace(day=1)
+            current_end = today
+            if today.month == 1:
+                prev_start = today.replace(year=today.year - 1, month=12, day=1)
+            else:
+                prev_start = today.replace(month=today.month - 1, day=1)
+            prev_end = current_start - timedelta(days=1)
+
+        current_period_label = f"{current_start} to {current_end}"
+        previous_period_label = f"{prev_start} to {prev_end}"
+
+        # Get expenses for both periods
+        current_expenses = self.store.list_expenses(
+            category=category,
+            start_date=current_start,
+            end_date=current_end,
+        )
+        prev_expenses = self.store.list_expenses(
+            category=category,
+            start_date=prev_start,
+            end_date=prev_end,
+        )
+
+        # Filter out cancelled
+        current_expenses = [e for e in current_expenses if e.status.value != "cancelled"]
+        prev_expenses = [e for e in prev_expenses if e.status.value != "cancelled"]
+
+        # Get all categories present in either period
+        categories = set()
+        for e in current_expenses:
+            categories.add(e.category)
+        for e in prev_expenses:
+            categories.add(e.category)
+
+        if category:
+            categories = {c for c in categories if c.lower() == category.lower()}
+
+        trends = []
+        for cat in sorted(categories):
+            current_spent = sum(e.amount for e in current_expenses if e.category.lower() == cat.lower())
+            prev_spent = sum(e.amount for e in prev_expenses if e.category.lower() == cat.lower())
+
+            change = current_spent - prev_spent
+            if prev_spent > 0:
+                change_pct = (change / prev_spent) * 100
+            elif current_spent > 0:
+                change_pct = 100.0  # New spending
+            else:
+                change_pct = 0.0
+
+            if abs(change_pct) < 5:
+                direction = TrendDirection.FLAT
+            elif change_pct > 0:
+                direction = TrendDirection.UP
+            else:
+                direction = TrendDirection.DOWN
+
+            trends.append(SpendingTrend(
+                category=cat,
+                current_period_spending=round(current_spent, 2),
+                previous_period_spending=round(prev_spent, 2),
+                change_amount=round(change, 2),
+                change_percent=round(change_pct, 1),
+                direction=direction,
+                period_type=period_type,
+                current_period=current_period_label,
+                previous_period=previous_period_label,
+            ))
+
+        return trends
+
+    def get_category_breakdown(
+        self,
+        start_date: Optional[date] = None,
+        end_date: Optional[date] = None,
+        top_n: int = 10,
+    ) -> list[CategoryBreakdown]:
+        """Get detailed spending breakdown by category.
+
+        Args:
+            start_date: Start of period (defaults to current month)
+            end_date: End of period (defaults to today)
+            top_n: Number of top categories to return
+        """
+        today = date.today()
+        if not start_date:
+            start_date = today.replace(day=1)
+        if not end_date:
+            end_date = today
+
+        expenses = self.store.list_expenses(start_date=start_date, end_date=end_date)
+        expenses = [e for e in expenses if e.status.value != "cancelled"]
+
+        if not expenses:
+            return []
+
+        # Group by category
+        cat_data: dict[str, dict] = {}
+        for e in expenses:
+            cat = e.category
+            if cat not in cat_data:
+                cat_data[cat] = {"amounts": [], "vendors": set()}
+            cat_data[cat]["amounts"].append(e.amount)
+            if e.vendor:
+                cat_data[cat]["vendors"].add(e.vendor)
+
+        total_spending = sum(e.amount for e in expenses)
+
+        breakdowns = []
+        for cat, data in sorted(cat_data.items(), key=lambda x: sum(x[1]["amounts"]), reverse=True)[:top_n]:
+            amounts = data["amounts"]
+            cat_total = sum(amounts)
+            percentage = (cat_total / total_spending * 100) if total_spending > 0 else 0
+
+            breakdowns.append(CategoryBreakdown(
+                category=cat,
+                total=round(cat_total, 2),
+                count=len(amounts),
+                average=round(cat_total / len(amounts), 2),
+                percentage=round(percentage, 1),
+                largest_expense=round(max(amounts), 2),
+                vendors=sorted(data["vendors"])[:5],
+            ))
+
+        return breakdowns
+
+    def compare_periods(
+        self,
+        period_a_start: date,
+        period_a_end: date,
+        period_b_start: date,
+        period_b_end: date,
+    ) -> PeriodComparison:
+        """Compare spending between two time periods.
+
+        Args:
+            period_a_start: Start of period A (typically the older period)
+            period_a_end: End of period A
+            period_b_start: Start of period B (typically the newer period)
+            period_b_end: End of period B
+        """
+        expenses_a = self.store.list_expenses(start_date=period_a_start, end_date=period_a_end)
+        expenses_b = self.store.list_expenses(start_date=period_b_start, end_date=period_b_end)
+
+        expenses_a = [e for e in expenses_a if e.status.value != "cancelled"]
+        expenses_b = [e for e in expenses_b if e.status.value != "cancelled"]
+
+        total_a = sum(e.amount for e in expenses_a)
+        total_b = sum(e.amount for e in expenses_b)
+
+        change = total_b - total_a
+        change_pct = (change / total_a * 100) if total_a > 0 else (100.0 if total_b > 0 else 0.0)
+
+        if abs(change_pct) < 5:
+            direction = TrendDirection.FLAT
+        elif change_pct > 0:
+            direction = TrendDirection.UP
+        else:
+            direction = TrendDirection.DOWN
+
+        # Per-category trends
+        all_categories = set()
+        for e in expenses_a + expenses_b:
+            all_categories.add(e.category)
+
+        category_trends = []
+        for cat in sorted(all_categories):
+            cat_a = sum(e.amount for e in expenses_a if e.category.lower() == cat.lower())
+            cat_b = sum(e.amount for e in expenses_b if e.category.lower() == cat.lower())
+
+            cat_change = cat_b - cat_a
+            if cat_a > 0:
+                cat_change_pct = (cat_change / cat_a) * 100
+            elif cat_b > 0:
+                cat_change_pct = 100.0
+            else:
+                cat_change_pct = 0.0
+
+            if abs(cat_change_pct) < 5:
+                cat_direction = TrendDirection.FLAT
+            elif cat_change_pct > 0:
+                cat_direction = TrendDirection.UP
+            else:
+                cat_direction = TrendDirection.DOWN
+
+            category_trends.append(SpendingTrend(
+                category=cat,
+                current_period_spending=round(cat_b, 2),
+                previous_period_spending=round(cat_a, 2),
+                change_amount=round(cat_change, 2),
+                change_percent=round(cat_change_pct, 1),
+                direction=cat_direction,
+                period_type="custom",
+                current_period=f"{period_b_start} to {period_b_end}",
+                previous_period=f"{period_a_start} to {period_a_end}",
+            ))
+
+        return PeriodComparison(
+            period_a_start=period_a_start,
+            period_a_end=period_a_end,
+            period_b_start=period_b_start,
+            period_b_end=period_b_end,
+            period_a_total=round(total_a, 2),
+            period_b_total=round(total_b, 2),
+            change_amount=round(change, 2),
+            change_percent=round(change_pct, 1),
+            direction=direction,
+            category_trends=category_trends,
+        )
+
+    # --- v0.3.0: Budget Templates ---
+
+    def list_budget_templates(self, category: Optional[str] = None) -> list[BudgetTemplate]:
+        """List available budget templates (built-in + custom)."""
+        templates = list(BUILTIN_BUDGET_TEMPLATES)
+
+        # Load custom templates from store
+        custom_templates = self.store.list_budget_templates()
+        templates.extend(custom_templates)
+
+        if category:
+            templates = [t for t in templates if t.category.lower() == category.lower() or t.category == "all"]
+
+        return templates
+
+    def get_budget_template(self, template_id: str) -> Optional[BudgetTemplate]:
+        """Get a specific budget template by ID."""
+        for t in self.list_budget_templates():
+            if t.id == template_id:
+                return t
+        return None
+
+    def create_budget_template(
+        self,
+        name: str,
+        category: str,
+        default_limit: float,
+        period: BudgetPeriod,
+        description: str = "",
+        currency: str = "USD",
+        suggested_alerts: Optional[list[AlertThreshold]] = None,
+        suggested_rules: Optional[list[dict]] = None,
+        tags: Optional[list[str]] = None,
+    ) -> BudgetTemplate:
+        """Create a custom budget template."""
+        template = BudgetTemplate(
+            name=name,
+            description=description,
+            category=category,
+            default_limit=default_limit,
+            period=period,
+            currency=currency,
+            suggested_alerts=suggested_alerts or [],
+            suggested_rules=suggested_rules or [],
+            tags=tags or [],
+            is_builtin=False,
+        )
+        return self.store.save_budget_template(template)
+
+    def instantiate_budget_template(
+        self,
+        template_id: str,
+        name: Optional[str] = None,
+        limit: Optional[float] = None,
+        currency: Optional[str] = None,
+    ) -> Budget:
+        """Create a budget from a template.
+
+        Args:
+            template_id: Template to instantiate
+            name: Override template name
+            limit: Override template default limit
+            currency: Override template currency
+        """
+        template = self.get_budget_template(template_id)
+        if not template:
+            raise ValueError(f"Template {template_id} not found")
+
+        budget = self.create_budget(
+            name=name or template.name,
+            limit=limit or template.default_limit,
+            period=template.period,
+            category=template.category if template.category != "all" else None,
+            currency=currency or template.currency,
+        )
+
+        # Apply suggested alerts if template has them
+        if template.suggested_alerts:
+            budget = self.update_alert_thresholds(budget.id, template.suggested_alerts)
+
+        # Create suggested spending rules
+        for rule_config in template.suggested_rules:
+            try:
+                self.create_spending_rule(
+                    name=rule_config.get("name", f"Rule from {template.name}"),
+                    category=template.category if template.category != "all" else rule_config.get("category", "all"),
+                    action=SpendingRuleAction(rule_config.get("action", "warn")),
+                    threshold_amount=rule_config.get("threshold_amount"),
+                    requires_approval_above=rule_config.get("requires_approval_above"),
+                    budget_id=budget.id,
+                )
+            except (ValueError, KeyError):
+                pass  # Skip invalid rules
+
+        return budget

@@ -1,5 +1,4 @@
 """Pydantic models for Agent Budget."""
-
 from __future__ import annotations
 
 import uuid
@@ -51,6 +50,12 @@ class SpendingRuleAction(str, Enum):
     WARN = "warn"
     BLOCK = "block"
     APPROVE = "approve"
+
+
+class TrendDirection(str, Enum):
+    UP = "up"
+    DOWN = "down"
+    FLAT = "flat"
 
 
 # --- Models ---
@@ -160,7 +165,7 @@ class Expense(BaseModel):
     budget_id: Optional[str] = Field(default=None, description="ID of the budget this expense counts against")
     metadata: dict = Field(default_factory=dict, description="Extra metadata (e.g., vendor, receipt URL)")
     vendor: Optional[str] = Field(default=None, description="Vendor or merchant name")
-    receipt_url: Optional[str] = Field(default=None, description="URL to receipt or invoice")
+    receipt_url: Optional[str] = None
     reimbursable: bool = Field(default=False, description="Whether this expense is reimbursable")
     approved_by: Optional[str] = Field(default=None, description="Who approved this expense (for spending rules)")
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
@@ -384,6 +389,71 @@ class CurrencyInfo(BaseModel):
     decimal_places: int = 2
 
 
+# --- v0.3.0 Analytics Models ---
+
+class SpendingTrend(BaseModel):
+    """Spending trend analysis for a category or overall."""
+    category: str = Field(description="Category name (or 'total' for overall)")
+    current_period_spending: float = Field(description="Spending in the current period")
+    previous_period_spending: float = Field(description="Spending in the previous period")
+    change_amount: float = Field(description="Absolute change in spending")
+    change_percent: float = Field(description="Percentage change in spending (-100 to +inf)")
+    direction: TrendDirection = Field(description="Trend direction (up, down, flat)")
+    period_type: str = Field(description="Period type (e.g., 'monthly', 'weekly')")
+    current_period: str = Field(description="Current period description")
+    previous_period: str = Field(description="Previous period description")
+
+
+class CategoryBreakdown(BaseModel):
+    """Detailed breakdown of spending by category for a period."""
+    category: str = Field(description="Category name")
+    total: float = Field(ge=0, description="Total spending in category")
+    count: int = Field(ge=0, description="Number of expenses")
+    average: float = Field(ge=0, description="Average expense amount")
+    percentage: float = Field(ge=0, description="Percentage of total spending")
+    largest_expense: Optional[float] = Field(default=None, description="Largest single expense")
+    vendors: list[str] = Field(default_factory=list, description="Top vendors in this category")
+
+
+class PeriodComparison(BaseModel):
+    """Comparison of spending between two time periods."""
+    period_a_start: date = Field(description="Start of period A")
+    period_a_end: date = Field(description="End of period A")
+    period_b_start: date = Field(description="Start of period B")
+    period_b_end: date = Field(description="End of period B")
+    period_a_total: float = Field(description="Total spending in period A")
+    period_b_total: float = Field(description="Total spending in period B")
+    change_amount: float = Field(description="Absolute change")
+    change_percent: float = Field(description="Percentage change")
+    direction: TrendDirection = Field(description="Trend direction")
+    category_trends: list[SpendingTrend] = Field(default_factory=list, description="Per-category trends")
+
+
+class BudgetTemplate(BaseModel):
+    """A pre-built budget template for common agent scenarios."""
+    id: str = Field(default_factory=lambda: f"TPL-{uuid.uuid4().hex[:8].upper()}")
+    name: str = Field(min_length=1, description="Template name")
+    description: str = Field(default="", description="Template description")
+    category: str = Field(description="Budget category")
+    default_limit: float = Field(gt=0, description="Default spending limit")
+    period: BudgetPeriod = Field(description="Budget period")
+    currency: str = Field(default="USD", description="Default currency")
+    suggested_alerts: list[AlertThreshold] = Field(default_factory=list, description="Suggested alert thresholds")
+    suggested_rules: list[dict] = Field(default_factory=list, description="Suggested spending rules config")
+    tags: list[str] = Field(default_factory=list, description="Tags for this template")
+    is_builtin: bool = Field(default=False, description="Whether this is a built-in template")
+
+
+class CSVImportResult(BaseModel):
+    """Result of a CSV import operation."""
+    total_rows: int = Field(description="Total rows in the CSV file")
+    imported: int = Field(description="Successfully imported rows")
+    skipped: int = Field(description="Skipped rows (empty or invalid)")
+    errors: list[str] = Field(default_factory=list, description="Import errors")
+    expense_ids: list[str] = Field(default_factory=list, description="IDs of created expenses")
+    total_amount: float = Field(default=0.0, description="Total amount of imported expenses")
+
+
 # --- Currency registry ---
 
 SUPPORTED_CURRENCIES: dict[str, CurrencyInfo] = {
@@ -410,3 +480,120 @@ def format_currency(amount: float, currency: str = "USD") -> str:
     info = SUPPORTED_CURRENCIES.get(currency, CurrencyInfo(code=currency, name=currency, symbol=currency, decimal_places=2))
     formatted = f"{amount:,.{info.decimal_places}f}"
     return f"{info.symbol}{formatted}"
+
+
+# --- Built-in Budget Templates ---
+
+BUILTIN_BUDGET_TEMPLATES: list[BudgetTemplate] = [
+    BudgetTemplate(
+        id="TPL-API001",
+        name="API Costs",
+        description="Budget for API usage costs (LLM, cloud APIs, etc.)",
+        category="api",
+        default_limit=500.0,
+        period=BudgetPeriod.MONTHLY,
+        currency="USD",
+        suggested_alerts=[
+            AlertThreshold(percent=50, level=AlertLevel.INFO),
+            AlertThreshold(percent=80, level=AlertLevel.WARNING),
+            AlertThreshold(percent=100, level=AlertLevel.CRITICAL),
+        ],
+        suggested_rules=[
+            {"name": "API Daily Cap", "action": "block", "threshold_amount": 100.0},
+        ],
+        tags=["api", "cloud", "llm"],
+        is_builtin=True,
+    ),
+    BudgetTemplate(
+        id="TPL-COMPUTE",
+        name="Compute Costs",
+        description="Budget for compute infrastructure (servers, containers, serverless)",
+        category="compute",
+        default_limit=1000.0,
+        period=BudgetPeriod.MONTHLY,
+        currency="USD",
+        suggested_alerts=[
+            AlertThreshold(percent=60, level=AlertLevel.INFO),
+            AlertThreshold(percent=85, level=AlertLevel.WARNING),
+            AlertThreshold(percent=100, level=AlertLevel.CRITICAL),
+        ],
+        suggested_rules=[
+            {"name": "Compute Approval", "action": "block", "requires_approval_above": 200.0},
+        ],
+        tags=["compute", "infrastructure", "servers"],
+        is_builtin=True,
+    ),
+    BudgetTemplate(
+        id="TPL-SAAS",
+        name="SaaS Subscriptions",
+        description="Budget for SaaS tools and subscriptions",
+        category="saas",
+        default_limit=300.0,
+        period=BudgetPeriod.MONTHLY,
+        currency="USD",
+        suggested_alerts=[
+            AlertThreshold(percent=75, level=AlertLevel.WARNING),
+            AlertThreshold(percent=100, level=AlertLevel.CRITICAL),
+        ],
+        suggested_rules=[
+            {"name": "SaaS Cap", "action": "warn", "threshold_amount": 250.0},
+        ],
+        tags=["saas", "subscriptions", "tools"],
+        is_builtin=True,
+    ),
+    BudgetTemplate(
+        id="TPL-STORAGE",
+        name="Storage & Data",
+        description="Budget for cloud storage, databases, and data transfer",
+        category="storage",
+        default_limit=200.0,
+        period=BudgetPeriod.MONTHLY,
+        currency="USD",
+        suggested_alerts=[
+            AlertThreshold(percent=70, level=AlertLevel.WARNING),
+            AlertThreshold(percent=100, level=AlertLevel.CRITICAL),
+        ],
+        suggested_rules=[],
+        tags=["storage", "database", "data"],
+        is_builtin=True,
+    ),
+    BudgetTemplate(
+        id="TPL-AGENT",
+        name="Full Agent Stack",
+        description="Complete budget for an autonomous agent covering all categories",
+        category="all",
+        default_limit=2000.0,
+        period=BudgetPeriod.MONTHLY,
+        currency="USD",
+        suggested_alerts=[
+            AlertThreshold(percent=50, level=AlertLevel.INFO),
+            AlertThreshold(percent=75, level=AlertLevel.WARNING),
+            AlertThreshold(percent=90, level=AlertLevel.WARNING),
+            AlertThreshold(percent=100, level=AlertLevel.CRITICAL),
+        ],
+        suggested_rules=[
+            {"name": "Large Expense Approval", "action": "approve", "requires_approval_above": 500.0},
+        ],
+        tags=["agent", "full-stack", "comprehensive"],
+        is_builtin=True,
+    ),
+    BudgetTemplate(
+        id="TPL-DATAPROC",
+        name="Data Processing",
+        description="Budget for data pipelines, ETL, and batch processing",
+        category="data-processing",
+        default_limit=800.0,
+        period=BudgetPeriod.MONTHLY,
+        currency="USD",
+        suggested_alerts=[
+            AlertThreshold(percent=60, level=AlertLevel.INFO),
+            AlertThreshold(percent=85, level=AlertLevel.WARNING),
+            AlertThreshold(percent=100, level=AlertLevel.CRITICAL),
+        ],
+        suggested_rules=[
+            {"name": "Data Processing Cap", "action": "block", "threshold_amount": 750.0},
+        ],
+        tags=["data", "etl", "pipelines", "processing"],
+        is_builtin=True,
+    ),
+]

@@ -27,6 +27,7 @@ class BudgetStore:
         self._savings_file = self.data_dir / "savings.json"
         self._rules_file = self.data_dir / "rules.json"
         self._rollovers_file = self.data_dir / "rollovers.json"
+        self._templates_file = self.data_dir / "templates.json"
 
     # --- JSON helpers ---
 
@@ -301,3 +302,42 @@ class BudgetStore:
         if not rollovers:
             return None
         return sorted(rollovers, key=lambda r: r.to_period_start, reverse=True)[0]
+
+    # --- Budget Templates ---
+
+    def list_budget_templates(self) -> list:
+        """List custom budget templates (built-ins are in models.py)."""
+        from .models import BudgetTemplate
+        data = self._read_json(self._templates_file)
+        return [BudgetTemplate(**d) for d in data]
+
+    def get_budget_template(self, template_id: str) -> Optional:
+        """Get a custom budget template by ID."""
+        for t in self.list_budget_templates():
+            if t.id == template_id:
+                return t
+        return None
+
+    def save_budget_template(self, template) -> object:
+        """Save a budget template."""
+        from .models import BudgetTemplate
+        templates = self.list_budget_templates()
+        found = False
+        for i, t in enumerate(templates):
+            if t.id == template.id:
+                templates[i] = template
+                found = True
+                break
+        if not found:
+            templates.append(template)
+        self._write_json(self._templates_file, [t.model_dump() for t in templates])
+        return template
+
+    def delete_budget_template(self, template_id: str) -> bool:
+        """Delete a custom budget template."""
+        templates = self.list_budget_templates()
+        new_templates = [t for t in templates if t.id != template_id]
+        if len(new_templates) == len(templates):
+            return False
+        self._write_json(self._templates_file, [t.model_dump() for t in new_templates])
+        return True
