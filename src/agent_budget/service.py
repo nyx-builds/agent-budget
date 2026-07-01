@@ -13,6 +13,8 @@ from .models import (
     SUPPORTED_CURRENCIES,
     SpendingTrend, TrendDirection, CategoryBreakdown, PeriodComparison,
     BudgetTemplate, CSVImportResult, BUILTIN_BUDGET_TEMPLATES,
+    Income, RecurringIncome, IncomeStatus,
+    CashFlowSummary, BurnRate, FinancialDashboard,
 )
 from .store import BudgetStore
 
@@ -760,6 +762,8 @@ class BudgetService:
         savings_goals = self.store.list_savings_goals()
         spending_rules = self.store.list_spending_rules()
         rollovers = self.store.list_rollovers()
+        incomes = self.store.list_income()
+        recurring_incomes = self.store.list_recurring_income()
 
         if format == "json":
             import json
@@ -771,11 +775,13 @@ class BudgetService:
                 "spending_rules": [r.model_dump() for r in spending_rules],
                 "rollovers": [r.model_dump() for r in rollovers],
                 "alerts": [a.model_dump() for a in alerts],
+                "incomes": [i.model_dump() for i in incomes],
+                "recurring_incomes": [r.model_dump() for r in recurring_incomes],
             }
             return json.dumps(data, indent=2, default=str)
 
         elif format == "csv":
-            lines = ["type,id,name/description,amount,category,date,currency"]
+            lines = ["type,id,name/description,amount,category/source,date,currency"]
             for b in budgets:
                 lines.append(f"budget,{b.id},{b.name},{b.limit},{b.category or ''},,{b.currency}")
             for e in expenses:
@@ -786,6 +792,10 @@ class BudgetService:
                 lines.append(f"savings,{g.id},{g.name},{g.current_amount}/{g.target_amount},{g.category or ''},,{g.currency}")
             for r in spending_rules:
                 lines.append(f"rule,{r.id},{r.name},{r.threshold_amount or ''},{r.category},,{r.action.value}")
+            for i in incomes:
+                lines.append(f"income,{i.id},{i.description},{i.amount},{i.source},{i.income_date},{i.currency}")
+            for ri in recurring_incomes:
+                lines.append(f"recurring-income,{ri.id},{ri.name},{ri.amount},{ri.source},{ri.frequency.value},{ri.currency}")
             return "\n".join(lines)
 
         elif format == "markdown":
@@ -827,6 +837,20 @@ class BudgetService:
             lines.append("|------|--------|-----------|----------|----------|")
             for r in recurring:
                 lines.append(f"| {r.name} | {r.amount:.2f} | {r.frequency.value} | {r.category} | {r.next_due} |")
+            lines.append("")
+            lines.append("## Income")
+            lines.append("")
+            lines.append("| Date | Source | Amount | Status | Invoice Ref |")
+            lines.append("|------|--------|--------|--------|-------------|")
+            for i in incomes[:50]:
+                lines.append(f"| {i.income_date} | {i.source} | {i.amount:.2f} | {i.status.value} | {i.invoice_ref or '-'} |")
+            lines.append("")
+            lines.append("## Recurring Income")
+            lines.append("")
+            lines.append("| Name | Amount | Frequency | Source | Next Due |")
+            lines.append("|------|--------|-----------|--------|----------|")
+            for ri in recurring_incomes:
+                lines.append(f"| {ri.name} | {ri.amount:.2f} | {ri.frequency.value} | {ri.source} | {ri.next_due} |")
             return "\n".join(lines)
 
         else:
@@ -1384,3 +1408,442 @@ class BudgetService:
                 pass  # Skip invalid rules
 
         return budget
+
+    # --- v0.4.0: Income Tracking ---
+
+    def add_income(
+        self,
+        amount: float,
+        source: str,
+        description: str = "",
+        income_date: Optional[date] = None,
+        tags: Optional[list[str]] = None,
+        currency: str = "USD",
+        status: IncomeStatus = IncomeStatus.RECEIVED,
+        invoice_ref: Optional[str] = None,
+        metadata: Optional[dict] = None,
+        recurring_id: Optional[str] = None,
+    ) -> Income:
+        """Record a new income entry."""
+        if amount <= 0:
+            raise ValueError("Income amount must be positive")
+        income = Income(
+            amount=amount,
+            source=source,
+            description=description,
+            income_date=income_date or date.today(),
+            tags=tags or [],
+            currency=currency,
+            status=status,
+            invoice_ref=invoice_ref,
+            metadata=metadata or {},
+            recurring_id=recurring_id,
+        )
+        return self.store.save_income(income)
+
+    def update_income(
+        self,
+        income_id: str,
+        amount: Optional[float] = None,
+        source: Optional[str] = None,
+        description: Optional[str] = None,
+        income_date: Optional[date] = None,
+        tags: Optional[list[str]] = None,
+        status: Optional[IncomeStatus] = None,
+        invoice_ref: Optional[str] = None,
+    ) -> Income:
+        """Update an existing income entry."""
+        income = self.store.get_income(income_id)
+        if not income:
+            raise ValueError(f"Income {income_id} not found")
+        if amount is not None:
+            if amount <= 0:
+                raise ValueError("Income amount must be positive")
+            income.amount = amount
+        if source is not None:
+            income.source = source
+        if description is not None:
+            income.description = description
+        if income_date is not None:
+            income.income_date = income_date
+        if tags is not None:
+            income.tags = tags
+        if status is not None:
+            income.status = status
+        if invoice_ref is not None:
+            income.invoice_ref = invoice_ref
+        return self.store.save_income(income)
+
+    def delete_income(self, income_id: str) -> bool:
+        return self.store.delete_income(income_id)
+
+    def list_income(
+        self,
+        source: Optional[str] = None,
+        start_date: Optional[date] = None,
+        end_date: Optional[date] = None,
+        tags: Optional[list[str]] = None,
+        status: Optional[str] = None,
+    ) -> list[Income]:
+        return self.store.list_income(
+            source=source, start_date=start_date, end_date=end_date,
+            tags=tags, status=status,
+        )
+
+    def get_income(self, income_id: str) -> Optional[Income]:
+        return self.store.get_income(income_id)
+
+    def get_total_income(
+        self,
+        start_date: Optional[date] = None,
+        end_date: Optional[date] = None,
+        source: Optional[str] = None,
+    ) -> float:
+        """Get total income for a period."""
+        incomes = self.list_income(start_date=start_date, end_date=end_date, source=source)
+        return sum(i.amount for i in incomes if i.status != IncomeStatus.CANCELLED)
+
+    def get_income_summary(
+        self,
+        start_date: Optional[date] = None,
+        end_date: Optional[date] = None,
+    ) -> dict[str, float]:
+        """Get income breakdown by source."""
+        incomes = self.list_income(start_date=start_date, end_date=end_date)
+        summary: dict[str, float] = {}
+        for inc in incomes:
+            if inc.status == IncomeStatus.CANCELLED:
+                continue
+            summary[inc.source] = summary.get(inc.source, 0.0) + inc.amount
+        return dict(sorted(summary.items(), key=lambda x: x[1], reverse=True))
+
+    # --- v0.4.0: Recurring Income ---
+
+    def add_recurring_income(
+        self,
+        name: str,
+        amount: float,
+        source: str,
+        frequency: RecurringFrequency,
+        description: str = "",
+        currency: str = "USD",
+        tags: Optional[list[str]] = None,
+        start_date: Optional[date] = None,
+        end_date: Optional[date] = None,
+    ) -> RecurringIncome:
+        """Create a recurring income template."""
+        if amount <= 0:
+            raise ValueError("Recurring income amount must be positive")
+        recurring = RecurringIncome(
+            name=name,
+            amount=amount,
+            source=source,
+            frequency=frequency,
+            description=description,
+            currency=currency,
+            tags=tags or [],
+            start_date=start_date or date.today(),
+            end_date=end_date,
+            next_due=start_date or date.today(),
+        )
+        return self.store.save_recurring_income(recurring)
+
+    def process_recurring_income(self, ref_date: Optional[date] = None) -> list[Income]:
+        """Process all due recurring income, generating income entries."""
+        ref = ref_date or date.today()
+        recurring_list = self.store.list_recurring_income(active_only=True)
+        generated: list[Income] = []
+
+        for rec in recurring_list:
+            # Check if end_date has passed
+            if rec.end_date and ref > rec.end_date:
+                continue
+
+            # Process all due occurrences
+            while rec.next_due <= ref:
+                if rec.end_date and rec.next_due > rec.end_date:
+                    break
+
+                income = self.add_income(
+                    amount=rec.amount,
+                    source=rec.source,
+                    description=rec.description or rec.name,
+                    income_date=rec.next_due,
+                    tags=rec.tags,
+                    currency=rec.currency,
+                    recurring_id=rec.id,
+                )
+                generated.append(income)
+                rec.next_due = rec.advance_next_due()
+
+            self.store.save_recurring_income(rec)
+
+        return generated
+
+    def list_recurring_income(self, active_only: bool = False) -> list[RecurringIncome]:
+        return self.store.list_recurring_income(active_only=active_only)
+
+    def get_recurring_income(self, recurring_id: str) -> Optional[RecurringIncome]:
+        return self.store.get_recurring_income(recurring_id)
+
+    def delete_recurring_income(self, recurring_id: str) -> bool:
+        return self.store.delete_recurring_income(recurring_id)
+
+    def pause_recurring_income(self, recurring_id: str) -> RecurringIncome:
+        rec = self.store.get_recurring_income(recurring_id)
+        if not rec:
+            raise ValueError(f"Recurring income {recurring_id} not found")
+        rec.active = False
+        return self.store.save_recurring_income(rec)
+
+    def resume_recurring_income(self, recurring_id: str) -> RecurringIncome:
+        rec = self.store.get_recurring_income(recurring_id)
+        if not rec:
+            raise ValueError(f"Recurring income {recurring_id} not found")
+        rec.active = True
+        return self.store.save_recurring_income(rec)
+
+    # --- v0.4.0: Cash Flow Analysis ---
+
+    def get_cash_flow(
+        self,
+        start_date: Optional[date] = None,
+        end_date: Optional[date] = None,
+        currency: str = "USD",
+    ) -> CashFlowSummary:
+        """Get cash flow analysis for a period."""
+        end = end_date or date.today()
+        if start_date is None:
+            # Default to current month
+            start = end.replace(day=1)
+        else:
+            start = start_date
+
+        incomes = self.list_income(start_date=start, end_date=end)
+        expenses = self.store.list_expenses(start_date=start, end_date=end)
+
+        total_income = sum(i.amount for i in incomes if i.status != IncomeStatus.CANCELLED)
+        total_expenses = sum(e.amount for e in expenses if e.status.value != "cancelled")
+
+        net = total_income - total_expenses
+
+        # Calculate ratios
+        if total_income > 0:
+            savings_rate = (net / total_income) * 100
+            expense_ratio = (total_expenses / total_income) * 100
+        else:
+            savings_rate = 0.0
+            expense_ratio = 0.0
+
+        # Find largest income source and expense category
+        income_by_source: dict[str, float] = {}
+        for inc in incomes:
+            if inc.status != IncomeStatus.CANCELLED:
+                income_by_source[inc.source] = income_by_source.get(inc.source, 0.0) + inc.amount
+        largest_source = max(income_by_source, key=lambda k: income_by_source[k]) if income_by_source else None
+
+        expense_by_cat: dict[str, float] = {}
+        for exp in expenses:
+            if exp.status.value != "cancelled":
+                expense_by_cat[exp.category] = expense_by_cat.get(exp.category, 0.0) + exp.amount
+        largest_cat = max(expense_by_cat, key=lambda k: expense_by_cat[k]) if expense_by_cat else None
+
+        return CashFlowSummary(
+            start_date=start,
+            end_date=end,
+            total_income=total_income,
+            total_expenses=total_expenses,
+            net_cash_flow=net,
+            savings_rate=round(savings_rate, 2),
+            expense_ratio=round(expense_ratio, 2),
+            income_count=len(incomes),
+            expense_count=len(expenses),
+            largest_income_source=largest_source,
+            largest_expense_category=largest_cat,
+            currency=currency,
+            is_profitable=net > 0,
+        )
+
+    def get_burn_rate(self, months: int = 3, currency: str = "USD") -> BurnRate:
+        """Calculate burn rate and runway over the past N months."""
+        if months < 1:
+            raise ValueError("months must be at least 1")
+
+        today = date.today()
+        period_start = today - timedelta(days=30 * months)
+
+        total_expenses = 0.0
+        total_income = 0.0
+        monthly_burns: list[float] = []
+
+        # Calculate per-month burn for trend analysis
+        for m in range(months):
+            month_start = today - timedelta(days=30 * (m + 1))
+            month_end = today - timedelta(days=30 * m)
+            month_expenses = sum(
+                e.amount for e in self.store.list_expenses(start_date=month_start, end_date=month_end)
+                if e.status.value != "cancelled"
+            )
+            month_income = sum(
+                i.amount for i in self.list_income(start_date=month_start, end_date=month_end)
+                if i.status != IncomeStatus.CANCELLED
+            )
+            monthly_burns.append(month_expenses - month_income)
+
+        total_expenses = sum(
+            e.amount for e in self.store.list_expenses(start_date=period_start)
+            if e.status.value != "cancelled" and e.expense_date <= today
+        )
+        total_income = sum(
+            i.amount for i in self.list_income(start_date=period_start)
+            if i.status != IncomeStatus.CANCELLED and i.income_date <= today
+        )
+
+        avg_monthly_burn = total_expenses / months
+        avg_monthly_income = total_income / months
+        net_burn = avg_monthly_burn - avg_monthly_income
+
+        # Total savings across all goals
+        savings_goals = self.store.list_savings_goals()
+        total_savings = sum(g.current_amount for g in savings_goals)
+
+        # Calculate runway
+        if net_burn <= 0:
+            runway_months = None
+            projected_depletion = None
+            is_sustainable = True
+        else:
+            runway_months = total_savings / net_burn if net_burn > 0 else None
+            if runway_months is not None:
+                projected_depletion = today + timedelta(days=int(runway_months * 30))
+            else:
+                projected_depletion = None
+            is_sustainable = False
+
+        # Determine burn trend
+        if len(monthly_burns) >= 2:
+            recent = monthly_burns[0]  # Most recent month (index 0)
+            older = monthly_burns[-1]  # Oldest month
+            if recent > older * 1.1:
+                burn_trend = TrendDirection.UP
+            elif recent < older * 0.9:
+                burn_trend = TrendDirection.DOWN
+            else:
+                burn_trend = TrendDirection.FLAT
+        else:
+            burn_trend = TrendDirection.FLAT
+
+        return BurnRate(
+            avg_monthly_burn=round(avg_monthly_burn, 2),
+            avg_monthly_income=round(avg_monthly_income, 2),
+            net_burn=round(net_burn, 2),
+            runway_months=round(runway_months, 1) if runway_months else None,
+            total_savings=total_savings,
+            analysis_period_months=months,
+            is_sustainable=is_sustainable,
+            currency=currency,
+            burn_trend=burn_trend,
+            projected_depletion=projected_depletion,
+        )
+
+    def get_financial_dashboard(self, currency: str = "USD") -> FinancialDashboard:
+        """Get a comprehensive financial health dashboard."""
+        today = date.today()
+        budgets = self.store.list_budgets(active_only=True)
+        alerts = self.store.list_alerts()
+        savings_goals = self.store.list_savings_goals()
+
+        # Budget metrics
+        total_remaining = 0.0
+        total_limit = 0.0
+        over_limit = 0
+        for budget in budgets:
+            spent = self.get_spending_for_budget(budget.id, ref_date=today)
+            effective_limit = budget.effective_limit
+            total_limit += effective_limit
+            total_remaining += max(0, effective_limit - spent)
+            if spent > effective_limit:
+                over_limit += 1
+
+        # Savings metrics
+        total_savings = sum(g.current_amount for g in savings_goals if g.status != SavingsGoalStatus.COMPLETED)
+        total_savings += sum(g.current_amount for g in savings_goals if g.status == SavingsGoalStatus.COMPLETED)
+        total_targets = sum(g.target_amount for g in savings_goals)
+        savings_pct = (total_savings / total_targets * 100) if total_targets > 0 else 0.0
+
+        # Current month cash flow
+        month_start = today.replace(day=1)
+        cash_flow = self.get_cash_flow(start_date=month_start, end_date=today, currency=currency)
+
+        # Burn rate
+        burn_rate = self.get_burn_rate(months=3, currency=currency)
+
+        # Top spending categories this month
+        category_summary = self.get_category_summary(start_date=month_start, end_date=today)
+        top_categories = list(category_summary.keys())[:5]
+
+        # Calculate health score (0-100)
+        health_score = 0.0
+        # 1. Profitability (30 points)
+        if cash_flow.is_profitable:
+            health_score += 30
+        elif cash_flow.total_income > 0 and cash_flow.expense_ratio < 90:
+            health_score += 15
+
+        # 2. Budget adherence (25 points)
+        if len(budgets) > 0:
+            budget_health = 1.0 - (over_limit / len(budgets))
+            health_score += 25 * budget_health
+        else:
+            health_score += 10  # Some credit for having no budgets (neutral)
+
+        # 3. Savings (20 points)
+        if total_targets > 0:
+            health_score += 20 * min(1.0, savings_pct / 100)
+        elif total_savings > 0:
+            health_score += 10
+
+        # 4. Burn rate sustainability (15 points)
+        if burn_rate.is_sustainable:
+            health_score += 15
+        elif burn_rate.runway_months and burn_rate.runway_months > 6:
+            health_score += 8
+        elif burn_rate.runway_months and burn_rate.runway_months > 3:
+            health_score += 4
+
+        # 5. Alert health (10 points)
+        critical_alerts = sum(1 for a in alerts if a.level == AlertLevel.CRITICAL)
+        warning_alerts = sum(1 for a in alerts if a.level == AlertLevel.WARNING)
+        alert_penalty = min(10, critical_alerts * 5 + warning_alerts * 2)
+        health_score += 10 - alert_penalty
+
+        health_score = max(0, min(100, round(health_score, 1)))
+
+        if health_score >= 80:
+            health_status = "excellent"
+        elif health_score >= 60:
+            health_status = "good"
+        elif health_score >= 40:
+            health_status = "fair"
+        elif health_score >= 20:
+            health_status = "poor"
+        else:
+            health_status = "critical"
+
+        return FinancialDashboard(
+            as_of=today,
+            total_budget_remaining=round(total_remaining, 2),
+            total_budget_limit=round(total_limit, 2),
+            total_savings=round(total_savings, 2),
+            total_savings_targets=round(total_targets, 2),
+            savings_progress_pct=round(savings_pct, 1),
+            active_budgets=len(budgets),
+            budgets_over_limit=over_limit,
+            active_alerts=len(alerts),
+            monthly_cash_flow=cash_flow,
+            burn_rate=burn_rate,
+            health_score=health_score,
+            health_status=health_status,
+            currency=currency,
+            top_categories=top_categories,
+        )

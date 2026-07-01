@@ -11,6 +11,7 @@ from mcp.server.fastmcp import FastMCP
 from .models import (
     BudgetPeriod, RecurringFrequency, SpendingRuleAction,
     SavingsGoalStatus, SUPPORTED_CURRENCIES,
+    IncomeStatus,
 )
 from .service import BudgetService
 from .store import BudgetStore
@@ -1041,6 +1042,261 @@ def instantiate_budget_template(
         return json.dumps(budget.model_dump(), default=str, indent=2)
     except ValueError as e:
         return json.dumps({"error": str(e)})
+
+
+# --- v0.4.0: Income & Cash Flow Tools ---
+
+@mcp.tool()
+def add_income(
+    amount: float,
+    source: str,
+    description: str = "",
+    income_date: str | None = None,
+    tags: str = "",
+    currency: str = "USD",
+    status: str = "received",
+    invoice_ref: str | None = None,
+) -> str:
+    """Record a new income/revenue entry.
+
+    Args:
+        amount: Income amount (must be positive)
+        source: Income source (e.g., 'client-A', 'API-sales', 'consulting')
+        description: Description of the income
+        income_date: Date in YYYY-MM-DD format (defaults to today)
+        tags: Comma-separated tags
+        currency: Currency code (default USD)
+        status: Income status - 'received', 'pending', or 'cancelled'
+        invoice_ref: Optional invoice reference
+    """
+    svc = get_service()
+    try:
+        from datetime import datetime as dt
+        parsed_date = dt.strptime(income_date, "%Y-%m-%d").date() if income_date else None
+        tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else []
+        income = svc.add_income(
+            amount=amount,
+            source=source,
+            description=description,
+            income_date=parsed_date,
+            tags=tag_list,
+            currency=currency,
+            status=IncomeStatus(status),
+            invoice_ref=invoice_ref,
+        )
+        return json.dumps(income.model_dump(), default=str, indent=2)
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def list_income(
+    source: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    status: str | None = None,
+) -> str:
+    """List income entries with optional filters.
+
+    Args:
+        source: Filter by income source
+        start_date: Filter from date (YYYY-MM-DD)
+        end_date: Filter to date (YYYY-MM-DD)
+        status: Filter by status (received, pending, cancelled)
+    """
+    svc = get_service()
+    from datetime import datetime as dt
+    parsed_start = dt.strptime(start_date, "%Y-%m-%d").date() if start_date else None
+    parsed_end = dt.strptime(end_date, "%Y-%m-%d").date() if end_date else None
+    incomes = svc.list_income(
+        source=source, start_date=parsed_start, end_date=parsed_end, status=status,
+    )
+    return json.dumps([i.model_dump() for i in incomes], default=str, indent=2)
+
+
+@mcp.tool()
+def update_income(
+    income_id: str,
+    amount: float | None = None,
+    source: str | None = None,
+    description: str | None = None,
+    status: str | None = None,
+    invoice_ref: str | None = None,
+) -> str:
+    """Update an existing income entry.
+
+    Args:
+        income_id: Income entry ID
+        amount: New amount (optional)
+        source: New source (optional)
+        description: New description (optional)
+        status: New status (optional)
+        invoice_ref: New invoice reference (optional)
+    """
+    svc = get_service()
+    try:
+        income = svc.update_income(
+            income_id=income_id,
+            amount=amount,
+            source=source,
+            description=description,
+            status=IncomeStatus(status) if status else None,
+            invoice_ref=invoice_ref,
+        )
+        return json.dumps(income.model_dump(), default=str, indent=2)
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def delete_income(income_id: str) -> str:
+    """Delete an income entry.
+
+    Args:
+        income_id: Income entry ID to delete
+    """
+    svc = get_service()
+    deleted = svc.delete_income(income_id)
+    return json.dumps({"deleted": deleted, "income_id": income_id})
+
+
+@mcp.tool()
+def get_income_summary(
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> str:
+    """Get income breakdown by source for a period.
+
+    Args:
+        start_date: Start date (YYYY-MM-DD), defaults to 90 days ago
+        end_date: End date (YYYY-MM-DD), defaults to today
+    """
+    svc = get_service()
+    from datetime import datetime as dt, timedelta
+    end = dt.strptime(end_date, "%Y-%m-%d").date() if end_date else date.today()
+    start = dt.strptime(start_date, "%Y-%m-%d").date() if start_date else end - timedelta(days=90)
+    summary = svc.get_income_summary(start_date=start, end_date=end)
+    return json.dumps({"summary": summary, "total": sum(summary.values())}, default=str, indent=2)
+
+
+@mcp.tool()
+def add_recurring_income(
+    name: str,
+    amount: float,
+    source: str,
+    frequency: str,
+    description: str = "",
+    currency: str = "USD",
+    tags: str = "",
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> str:
+    """Create a recurring income template.
+
+    Args:
+        name: Name for this recurring income (e.g., 'Monthly consulting retainer')
+        amount: Amount per occurrence (must be positive)
+        source: Income source/counterparty
+        frequency: How often - 'daily', 'weekly', 'biweekly', 'monthly', 'quarterly', 'yearly'
+        description: Description
+        currency: Currency code (default USD)
+        tags: Comma-separated tags
+        start_date: Start date (YYYY-MM-DD), defaults to today
+        end_date: Optional end date (YYYY-MM-DD)
+    """
+    svc = get_service()
+    try:
+        from datetime import datetime as dt
+        parsed_start = dt.strptime(start_date, "%Y-%m-%d").date() if start_date else None
+        parsed_end = dt.strptime(end_date, "%Y-%m-%d").date() if end_date else None
+        tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else []
+        recurring = svc.add_recurring_income(
+            name=name,
+            amount=amount,
+            source=source,
+            frequency=RecurringFrequency(frequency),
+            description=description,
+            currency=currency,
+            tags=tag_list,
+            start_date=parsed_start,
+            end_date=parsed_end,
+        )
+        return json.dumps(recurring.model_dump(), default=str, indent=2)
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def list_recurring_income(active_only: bool = True) -> str:
+    """List recurring income templates.
+
+    Args:
+        active_only: If true, only show active templates (default true)
+    """
+    svc = get_service()
+    recurring = svc.list_recurring_income(active_only=active_only)
+    return json.dumps([r.model_dump() for r in recurring], default=str, indent=2)
+
+
+@mcp.tool()
+def process_recurring_income() -> str:
+    """Process all due recurring income entries. Generates income records for any recurring income that is due."""
+    svc = get_service()
+    generated = svc.process_recurring_income()
+    return json.dumps({
+        "processed": len(generated),
+        "total_amount": sum(i.amount for i in generated),
+        "income_ids": [i.id for i in generated],
+    }, default=str, indent=2)
+
+
+@mcp.tool()
+def get_cash_flow(
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> str:
+    """Get cash flow analysis (income vs expenses) for a period.
+
+    Args:
+        start_date: Start date (YYYY-MM-DD), defaults to start of current month
+        end_date: End date (YYYY-MM-DD), defaults to today
+
+    Returns net cash flow, savings rate, expense ratio, and profitability status.
+    """
+    svc = get_service()
+    from datetime import datetime as dt
+    parsed_start = dt.strptime(start_date, "%Y-%m-%d").date() if start_date else None
+    parsed_end = dt.strptime(end_date, "%Y-%m-%d").date() if end_date else None
+    flow = svc.get_cash_flow(start_date=parsed_start, end_date=parsed_end)
+    return json.dumps(flow.model_dump(), default=str, indent=2)
+
+
+@mcp.tool()
+def get_burn_rate(months: int = 3) -> str:
+    """Calculate burn rate and runway based on spending history.
+
+    Args:
+        months: Number of months to analyze (default 3)
+
+    Returns average monthly burn, net burn, runway in months, and sustainability status.
+    """
+    svc = get_service()
+    try:
+        burn = svc.get_burn_rate(months=months)
+        return json.dumps(burn.model_dump(), default=str, indent=2)
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def get_financial_dashboard() -> str:
+    """Get a comprehensive financial health dashboard.
+
+    Includes budget status, savings progress, cash flow, burn rate, and a health score (0-100).
+    """
+    svc = get_service()
+    dashboard = svc.get_financial_dashboard()
+    return json.dumps(dashboard.model_dump(), default=str, indent=2)
 
 
 def run_server():

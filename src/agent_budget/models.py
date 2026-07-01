@@ -454,6 +454,139 @@ class CSVImportResult(BaseModel):
     total_amount: float = Field(default=0.0, description="Total amount of imported expenses")
 
 
+# --- v0.4.0 Income & Cash Flow Models ---
+
+class IncomeStatus(str, Enum):
+    PENDING = "pending"
+    RECEIVED = "received"
+    CANCELLED = "cancelled"
+
+
+class RecurringIncome(BaseModel):
+    """A recurring income source that generates income entries on a schedule."""
+    id: str = Field(default_factory=lambda: f"RIC-{uuid.uuid4().hex[:8].upper()}")
+    name: str = Field(min_length=1, description="Name of the recurring income (e.g., 'Monthly consulting')")
+    amount: float = Field(gt=0, description="Amount per occurrence")
+    source: str = Field(min_length=1, description="Income source/counterparty")
+    frequency: RecurringFrequency = Field(description="How often income recurs")
+    description: str = Field(default="")
+    currency: str = Field(default="USD")
+    tags: list[str] = Field(default_factory=list)
+    start_date: date = Field(default_factory=date.today)
+    end_date: Optional[date] = Field(default=None, description="Optional end date")
+    next_due: date = Field(default_factory=date.today)
+    active: bool = Field(default=True)
+    metadata: dict = Field(default_factory=dict)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+    @field_validator("tags", mode="before")
+    @classmethod
+    def parse_tags(cls, v):
+        if isinstance(v, str):
+            return [t.strip() for t in v.split(",") if t.strip()]
+        return v
+
+    def advance_next_due(self) -> date:
+        """Calculate the next due date after the current one."""
+        d = self.next_due
+        if self.frequency == RecurringFrequency.DAILY:
+            return d + timedelta(days=1)
+        elif self.frequency == RecurringFrequency.WEEKLY:
+            return d + timedelta(weeks=1)
+        elif self.frequency == RecurringFrequency.BIWEEKLY:
+            return d + timedelta(weeks=2)
+        elif self.frequency == RecurringFrequency.MONTHLY:
+            month = d.month + 1
+            year = d.year
+            if month > 12:
+                month = 1
+                year += 1
+            return d.replace(month=month, year=year)
+        elif self.frequency == RecurringFrequency.QUARTERLY:
+            month = d.month + 3
+            year = d.year
+            if month > 12:
+                month -= 12
+                year += 1
+            return d.replace(month=month, year=year)
+        elif self.frequency == RecurringFrequency.YEARLY:
+            return d.replace(year=d.year + 1)
+        return d + timedelta(days=30)  # fallback
+
+
+class Income(BaseModel):
+    """A single income/revenue entry."""
+    id: str = Field(default_factory=lambda: f"INC-{uuid.uuid4().hex[:8].upper()}")
+    amount: float = Field(gt=0, description="Income amount")
+    source: str = Field(min_length=1, description="Income source (e.g., 'client-A', 'API-sales')")
+    description: str = Field(default="", description="Description of the income")
+    income_date: date = Field(default_factory=date.today, description="Date of the income")
+    tags: list[str] = Field(default_factory=list, description="Tags for grouping/filtering")
+    currency: str = Field(default="USD", description="Currency code")
+    status: IncomeStatus = Field(default=IncomeStatus.RECEIVED)
+    metadata: dict = Field(default_factory=dict, description="Extra metadata")
+    recurring_id: Optional[str] = Field(default=None, description="ID of recurring template if auto-generated")
+    invoice_ref: Optional[str] = Field(default=None, description="Optional invoice reference")
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+    @field_validator("tags", mode="before")
+    @classmethod
+    def parse_tags(cls, v):
+        if isinstance(v, str):
+            return [t.strip() for t in v.split(",") if t.strip()]
+        return v
+
+
+class CashFlowSummary(BaseModel):
+    """Cash flow analysis for a period."""
+    start_date: date = Field(description="Period start date")
+    end_date: date = Field(description="Period end date")
+    total_income: float = Field(default=0.0, description="Total income received")
+    total_expenses: float = Field(default=0.0, description="Total expenses incurred")
+    net_cash_flow: float = Field(default=0.0, description="Income minus expenses")
+    savings_rate: float = Field(default=0.0, description="Percentage of income saved (net/income * 100)")
+    expense_ratio: float = Field(default=0.0, description="Percentage of income spent (expenses/income * 100)")
+    income_count: int = Field(default=0, description="Number of income entries")
+    expense_count: int = Field(default=0, description="Number of expense entries")
+    largest_income_source: Optional[str] = Field(default=None, description="Top income source by amount")
+    largest_expense_category: Optional[str] = Field(default=None, description="Top expense category by amount")
+    currency: str = Field(default="USD")
+    is_profitable: bool = Field(default=False, description="Whether income exceeds expenses")
+
+
+class BurnRate(BaseModel):
+    """Burn rate and runway analysis."""
+    avg_monthly_burn: float = Field(description="Average monthly spending")
+    avg_monthly_income: float = Field(description="Average monthly income")
+    net_burn: float = Field(description="Net monthly burn (expenses - income), positive = burning")
+    runway_months: Optional[float] = Field(default=None, description="Months of runway at current net burn (None if profitable)")
+    total_savings: float = Field(default=0.0, description="Total savings across all goals")
+    analysis_period_months: int = Field(description="Number of months analyzed")
+    is_sustainable: bool = Field(default=False, description="Whether income covers expenses")
+    currency: str = Field(default="USD")
+    burn_trend: TrendDirection = Field(default=TrendDirection.FLAT, description="Is burn increasing, decreasing, or flat")
+    projected_depletion: Optional[date] = Field(default=None, description="Projected date savings run out (None if sustainable)")
+
+
+class FinancialDashboard(BaseModel):
+    """Comprehensive financial health summary."""
+    as_of: date = Field(description="Dashboard date")
+    total_budget_remaining: float = Field(default=0.0, description="Total remaining across all active budgets")
+    total_budget_limit: float = Field(default=0.0, description="Total budget limit across all active budgets")
+    total_savings: float = Field(default=0.0, description="Total saved across savings goals")
+    total_savings_targets: float = Field(default=0.0, description="Total savings targets")
+    savings_progress_pct: float = Field(default=0.0, description="Overall savings progress percentage")
+    active_budgets: int = Field(default=0, description="Number of active budgets")
+    budgets_over_limit: int = Field(default=0, description="Number of budgets over their limit")
+    active_alerts: int = Field(default=0, description="Number of active alerts")
+    monthly_cash_flow: Optional[CashFlowSummary] = Field(default=None, description="Current month cash flow")
+    burn_rate: Optional[BurnRate] = Field(default=None, description="Burn rate analysis")
+    health_score: float = Field(default=0.0, ge=0, le=100, description="Overall financial health score 0-100")
+    health_status: str = Field(default="unknown", description="Health status: excellent, good, fair, poor, critical")
+    currency: str = Field(default="USD")
+    top_categories: list[str] = Field(default_factory=list, description="Top spending categories")
+
+
 # --- Currency registry ---
 
 SUPPORTED_CURRENCIES: dict[str, CurrencyInfo] = {

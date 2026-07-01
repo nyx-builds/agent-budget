@@ -16,6 +16,7 @@ from .models import (
     BudgetPeriod, RecurringFrequency, AlertLevel, AlertThreshold,
     SpendingRuleAction, SavingsGoalStatus,
     SUPPORTED_CURRENCIES, format_currency,
+    IncomeStatus,
 )
 from .service import BudgetService
 from .store import BudgetStore
@@ -1158,6 +1159,347 @@ def template_use(template_id: str, name: Optional[str], limit: Optional[float], 
     except ValueError as e:
         console.print(f"[red]✗ {e}[/red]")
         sys.exit(1)
+
+
+# --- v0.4.0: Income Commands ---
+
+@main.group("income")
+def income_group():
+    """Manage income and revenue entries."""
+    pass
+
+
+@income_group.command("add")
+@click.argument("amount", type=float)
+@click.argument("source")
+@click.option("--description", "-d", default="", help="Description")
+@click.option("--date", "income_date", default=None, help="Date (YYYY-MM-DD)")
+@click.option("--tags", default="", help="Comma-separated tags")
+@click.option("--currency", default="USD", help="Currency code")
+@click.option("--status", default="received", type=click.Choice(["received", "pending", "cancelled"]))
+@click.option("--invoice-ref", default=None, help="Invoice reference")
+def income_add(amount: float, source: str, description: str, income_date: Optional[str],
+               tags: str, currency: str, status: str, invoice_ref: Optional[str]):
+    """Record a new income entry."""
+    svc = get_service()
+    try:
+        parsed_date = date.fromisoformat(income_date) if income_date else None
+        tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else []
+        income = svc.add_income(
+            amount=amount, source=source, description=description,
+            income_date=parsed_date, tags=tag_list, currency=currency,
+            status=IncomeStatus(status), invoice_ref=invoice_ref,
+        )
+        console.print(Panel(
+            f"[green]✓ Income recorded:[/green] {income.id}\n"
+            f"  Source: {income.source}\n"
+            f"  Amount: {format_currency(income.amount, income.currency)}\n"
+            f"  Date: {income.income_date}\n"
+            f"  Status: {income.status.value}",
+            title="Income Added",
+        ))
+    except ValueError as e:
+        console.print(f"[red]✗ {e}[/red]")
+        sys.exit(1)
+
+
+@income_group.command("list")
+@click.option("--source", default=None, help="Filter by source")
+@click.option("--start-date", default=None, help="Start date (YYYY-MM-DD)")
+@click.option("--end-date", default=None, help="End date (YYYY-MM-DD)")
+@click.option("--status", default=None, help="Filter by status")
+def income_list(source: Optional[str], start_date: Optional[str], end_date: Optional[str], status: Optional[str]):
+    """List income entries."""
+    svc = get_service()
+    parsed_start = date.fromisoformat(start_date) if start_date else None
+    parsed_end = date.fromisoformat(end_date) if end_date else None
+    incomes = svc.list_income(source=source, start_date=parsed_start, end_date=parsed_end, status=status)
+
+    if not incomes:
+        console.print("[yellow]No income entries found.[/yellow]")
+        return
+
+    table = Table(title="Income Entries")
+    table.add_column("ID", style="cyan")
+    table.add_column("Date", style="white")
+    table.add_column("Source", style="green")
+    table.add_column("Amount", justify="right", style="yellow")
+    table.add_column("Status")
+    table.add_column("Description")
+
+    total = 0.0
+    for inc in incomes:
+        if inc.status != IncomeStatus.CANCELLED:
+            total += inc.amount
+        table.add_row(
+            inc.id, str(inc.income_date), inc.source,
+            format_currency(inc.amount, inc.currency),
+            inc.status.value, inc.description[:40] if inc.description else "-",
+        )
+    console.print(table)
+    console.print(f"\n[bold green]Total (excl. cancelled): {format_currency(total)}[/bold green]")
+
+
+@income_group.command("delete")
+@click.argument("income_id")
+def income_delete(income_id: str):
+    """Delete an income entry."""
+    svc = get_service()
+    if svc.delete_income(income_id):
+        console.print(f"[green]✓ Deleted income {income_id}[/green]")
+    else:
+        console.print(f"[red]✗ Income {income_id} not found[/red]")
+        sys.exit(1)
+
+
+@main.group("recurring-income")
+def recurring_income_group():
+    """Manage recurring income templates."""
+    pass
+
+
+@recurring_income_group.command("add")
+@click.argument("name")
+@click.argument("amount", type=float)
+@click.argument("source")
+@click.argument("frequency", type=click.Choice([f.value for f in RecurringFrequency]))
+@click.option("--description", "-d", default="", help="Description")
+@click.option("--currency", default="USD")
+@click.option("--tags", default="", help="Comma-separated tags")
+@click.option("--start-date", default=None, help="Start date (YYYY-MM-DD)")
+@click.option("--end-date", default=None, help="End date (YYYY-MM-DD)")
+def recurring_income_add(name: str, amount: float, source: str, frequency: str,
+                         description: str, currency: str, tags: str,
+                         start_date: Optional[str], end_date: Optional[str]):
+    """Create a recurring income template."""
+    svc = get_service()
+    try:
+        parsed_start = date.fromisoformat(start_date) if start_date else None
+        parsed_end = date.fromisoformat(end_date) if end_date else None
+        tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else []
+        rec = svc.add_recurring_income(
+            name=name, amount=amount, source=source,
+            frequency=RecurringFrequency(frequency),
+            description=description, currency=currency, tags=tag_list,
+            start_date=parsed_start, end_date=parsed_end,
+        )
+        console.print(Panel(
+            f"[green]✓ Recurring income created:[/green] {rec.id}\n"
+            f"  Name: {rec.name}\n"
+            f"  Source: {rec.source}\n"
+            f"  Amount: {format_currency(rec.amount, rec.currency)}\n"
+            f"  Frequency: {rec.frequency.value}\n"
+            f"  Next Due: {rec.next_due}",
+            title="Recurring Income Created",
+        ))
+    except ValueError as e:
+        console.print(f"[red]✗ {e}[/red]")
+        sys.exit(1)
+
+
+@recurring_income_group.command("list")
+@click.option("--show-all", is_flag=True, help="Show inactive too")
+def recurring_income_list(show_all: bool):
+    """List recurring income templates."""
+    svc = get_service()
+    recurring = svc.list_recurring_income(active_only=not show_all)
+
+    if not recurring:
+        console.print("[yellow]No recurring income found.[/yellow]")
+        return
+
+    table = Table(title="Recurring Income")
+    table.add_column("ID", style="cyan")
+    table.add_column("Name", style="white")
+    table.add_column("Source", style="green")
+    table.add_column("Amount", justify="right", style="yellow")
+    table.add_column("Frequency")
+    table.add_column("Next Due")
+    table.add_column("Active")
+
+    for r in recurring:
+        table.add_row(
+            r.id, r.name, r.source,
+            format_currency(r.amount, r.currency),
+            r.frequency.value, str(r.next_due),
+            "✓" if r.active else "✗",
+        )
+    console.print(table)
+
+
+@recurring_income_group.command("process")
+def recurring_income_process():
+    """Process all due recurring income."""
+    svc = get_service()
+    generated = svc.process_recurring_income()
+    if generated:
+        console.print(f"[green]✓ Processed {len(generated)} recurring income entries[/green]")
+        total = sum(i.amount for i in generated)
+        console.print(f"  Total generated: {format_currency(total)}")
+        for inc in generated:
+            console.print(f"  • {inc.source}: {format_currency(inc.amount)} ({inc.income_date})")
+    else:
+        console.print("[yellow]No recurring income due for processing.[/yellow]")
+
+
+@recurring_income_group.command("pause")
+@click.argument("recurring_id")
+def recurring_income_pause(recurring_id: str):
+    """Pause a recurring income template."""
+    svc = get_service()
+    try:
+        rec = svc.pause_recurring_income(recurring_id)
+        console.print(f"[yellow]⏸ Paused recurring income {rec.name}[/yellow]")
+    except ValueError as e:
+        console.print(f"[red]✗ {e}[/red]")
+        sys.exit(1)
+
+
+@recurring_income_group.command("resume")
+@click.argument("recurring_id")
+def recurring_income_resume(recurring_id: str):
+    """Resume a paused recurring income template."""
+    svc = get_service()
+    try:
+        rec = svc.resume_recurring_income(recurring_id)
+        console.print(f"[green]▶ Resumed recurring income {rec.name}[/green]")
+    except ValueError as e:
+        console.print(f"[red]✗ {e}[/red]")
+        sys.exit(1)
+
+
+@recurring_income_group.command("delete")
+@click.argument("recurring_id")
+def recurring_income_delete(recurring_id: str):
+    """Delete a recurring income template."""
+    svc = get_service()
+    if svc.delete_recurring_income(recurring_id):
+        console.print(f"[green]✓ Deleted recurring income {recurring_id}[/green]")
+    else:
+        console.print(f"[red]✗ Recurring income {recurring_id} not found[/red]")
+        sys.exit(1)
+
+
+# --- Cash Flow & Dashboard Commands ---
+
+@main.command("cashflow")
+@click.option("--start-date", default=None, help="Start date (YYYY-MM-DD)")
+@click.option("--end-date", default=None, help="End date (YYYY-MM-DD)")
+def cashflow_cmd(start_date: Optional[str], end_date: Optional[str]):
+    """Show cash flow analysis (income vs expenses)."""
+    svc = get_service()
+    parsed_start = date.fromisoformat(start_date) if start_date else None
+    parsed_end = date.fromisoformat(end_date) if end_date else None
+    flow = svc.get_cash_flow(start_date=parsed_start, end_date=parsed_end)
+
+    color = "green" if flow.is_profitable else "red"
+    console.print(Panel(
+        f"[bold]Period:[/bold] {flow.start_date} to {flow.end_date}\n\n"
+        f"[green]Total Income:[/green]    {format_currency(flow.total_income, flow.currency)}\n"
+        f"[red]Total Expenses:[/red]   {format_currency(flow.total_expenses, flow.currency)}\n"
+        f"[bold {color}]Net Cash Flow:[/bold {color}]   {format_currency(flow.net_cash_flow, flow.currency)}\n\n"
+        f"Savings Rate:    {flow.savings_rate:.1f}%\n"
+        f"Expense Ratio:   {flow.expense_ratio:.1f}%\n"
+        f"Income Entries:  {flow.income_count}\n"
+        f"Expense Entries: {flow.expense_count}\n\n"
+        f"[bold]Status:[/bold] [{'green' if flow.is_profitable else 'red'}]{'PROFITABLE' if flow.is_profitable else 'RUNNING DEFICIT'}[/{'green' if flow.is_profitable else 'red'}]",
+        title="💰 Cash Flow Analysis",
+    ))
+
+
+@main.command("burn-rate")
+@click.option("--months", default=3, type=int, help="Number of months to analyze")
+def burn_rate_cmd(months: int):
+    """Show burn rate and runway analysis."""
+    svc = get_service()
+    try:
+        burn = svc.get_burn_rate(months=months)
+
+        if burn.is_sustainable:
+            status_color = "green"
+            status_text = "✓ SUSTAINABLE"
+        else:
+            status_color = "red"
+            status_text = "⚠ BURNING"
+
+        panel_content = (
+            f"[bold]Analysis Period:[/bold] {burn.analysis_period_months} months\n\n"
+            f"Avg Monthly Burn:   {format_currency(burn.avg_monthly_burn, burn.currency)}\n"
+            f"Avg Monthly Income: {format_currency(burn.avg_monthly_income, burn.currency)}\n"
+            f"[bold {status_color}]Net Burn:[/bold {status_color}]          {format_currency(burn.net_burn, burn.currency)}/mo\n\n"
+            f"Total Savings:      {format_currency(burn.total_savings, burn.currency)}\n"
+        )
+
+        if burn.runway_months is not None:
+            panel_content += f"Runway:             {burn.runway_months:.1f} months\n"
+            if burn.projected_depletion:
+                panel_content += f"Projected Depletion: {burn.projected_depletion}\n"
+        else:
+            panel_content += "Runway:             ∞ (sustainable)\n"
+
+        panel_content += f"Burn Trend:         {burn.burn_trend.value}\n\n"
+        panel_content += f"[bold {status_color}]{status_text}[/bold {status_color}]"
+
+        console.print(Panel(panel_content, title="🔥 Burn Rate & Runway"))
+    except ValueError as e:
+        console.print(f"[red]✗ {e}[/red]")
+        sys.exit(1)
+
+
+@main.command("dashboard")
+def dashboard_cmd():
+    """Show comprehensive financial health dashboard."""
+    svc = get_service()
+    dashboard = svc.get_financial_dashboard()
+
+    # Color based on health status
+    status_colors = {
+        "excellent": "bright_green",
+        "good": "green",
+        "fair": "yellow",
+        "poor": "red",
+        "critical": "bright_red",
+    }
+    sc = status_colors.get(dashboard.health_status, "white")
+
+    panel_content = (
+        f"[bold]Financial Health Score: [{sc}]{dashboard.health_score:.0f}/100[/{sc}] ({dashboard.health_status.upper()})[/bold]\n\n"
+        f"📊 Budgets:\n"
+        f"   Active: {dashboard.active_budgets}  |  Over Limit: {dashboard.budgets_over_limit}\n"
+        f"   Total Limit: {format_currency(dashboard.total_budget_limit, dashboard.currency)}\n"
+        f"   Remaining:   {format_currency(dashboard.total_budget_remaining, dashboard.currency)}\n\n"
+        f"💰 Savings:\n"
+        f"   Saved:  {format_currency(dashboard.total_savings, dashboard.currency)}\n"
+        f"   Target: {format_currency(dashboard.total_savings_targets, dashboard.currency)}\n"
+        f"   Progress: {dashboard.savings_progress_pct:.1f}%\n\n"
+    )
+
+    if dashboard.monthly_cash_flow:
+        cf = dashboard.monthly_cash_flow
+        cf_color = "green" if cf.is_profitable else "red"
+        panel_content += (
+            f"💹 Monthly Cash Flow:\n"
+            f"   Income:   {format_currency(cf.total_income, cf.currency)}\n"
+            f"   Expenses: {format_currency(cf.total_expenses, cf.currency)}\n"
+            f"   Net:      [{cf_color}]{format_currency(cf.net_cash_flow, cf.currency)}[/{cf_color}]\n\n"
+        )
+
+    if dashboard.burn_rate:
+        br = dashboard.burn_rate
+        br_status = "Sustainable" if br.is_sustainable else f"{br.runway_months:.1f}mo runway" if br.runway_months else "No savings"
+        panel_content += (
+            f"🔥 Burn Rate:\n"
+            f"   Monthly Burn: {format_currency(br.avg_monthly_burn, br.currency)}\n"
+            f"   Status: {br_status}\n"
+            f"   Trend: {br.burn_trend.value}\n\n"
+        )
+
+    if dashboard.active_alerts:
+        panel_content += f"⚠️  Active Alerts: {dashboard.active_alerts}\n"
+    if dashboard.top_categories:
+        panel_content += f"🏷️  Top Categories: {', '.join(dashboard.top_categories[:3])}\n"
+
+    console.print(Panel(panel_content, title=f"📋 Financial Dashboard (as of {dashboard.as_of})"))
 
 
 @main.command("serve")
