@@ -11,6 +11,7 @@ from typing import Optional
 from .models import (
     Budget, Expense, RecurringExpense, BudgetAlert,
     SavingsGoal, SavingsContribution, SpendingRule, BudgetRollover,
+    Income, RecurringIncome, IncomeStatus,
 )
 
 
@@ -28,6 +29,8 @@ class BudgetStore:
         self._rules_file = self.data_dir / "rules.json"
         self._rollovers_file = self.data_dir / "rollovers.json"
         self._templates_file = self.data_dir / "templates.json"
+        self._income_file = self.data_dir / "income.json"
+        self._recurring_income_file = self.data_dir / "recurring_income.json"
 
     # --- JSON helpers ---
 
@@ -340,4 +343,91 @@ class BudgetStore:
         if len(new_templates) == len(templates):
             return False
         self._write_json(self._templates_file, [t.model_dump() for t in new_templates])
+        return True
+
+    # --- Income ---
+
+    def list_income(
+        self,
+        source: Optional[str] = None,
+        start_date: Optional[date] = None,
+        end_date: Optional[date] = None,
+        tags: Optional[list[str]] = None,
+        status: Optional[str] = None,
+    ) -> list[Income]:
+        data = self._read_json(self._income_file)
+        incomes = [Income(**d) for d in data]
+        if source:
+            incomes = [i for i in incomes if i.source.lower() == source.lower()]
+        if start_date:
+            incomes = [i for i in incomes if i.income_date >= start_date]
+        if end_date:
+            incomes = [i for i in incomes if i.income_date <= end_date]
+        if tags:
+            incomes = [i for i in incomes if any(t in i.tags for t in tags)]
+        if status:
+            incomes = [i for i in incomes if i.status.value == status]
+        return sorted(incomes, key=lambda i: i.income_date, reverse=True)
+
+    def get_income(self, income_id: str) -> Optional[Income]:
+        for i in self.list_income():
+            if i.id == income_id:
+                return i
+        return None
+
+    def save_income(self, income: Income) -> Income:
+        incomes = self.list_income()
+        found = False
+        for idx, i in enumerate(incomes):
+            if i.id == income.id:
+                incomes[idx] = income
+                found = True
+                break
+        if not found:
+            incomes.append(income)
+        self._write_json(self._income_file, [i.model_dump() for i in incomes])
+        return income
+
+    def delete_income(self, income_id: str) -> bool:
+        incomes = self.list_income()
+        new_incomes = [i for i in incomes if i.id != income_id]
+        if len(new_incomes) == len(incomes):
+            return False
+        self._write_json(self._income_file, [i.model_dump() for i in new_incomes])
+        return True
+
+    # --- Recurring Income ---
+
+    def list_recurring_income(self, active_only: bool = False) -> list[RecurringIncome]:
+        data = self._read_json(self._recurring_income_file)
+        recurring = [RecurringIncome(**d) for d in data]
+        if active_only:
+            recurring = [r for r in recurring if r.active]
+        return recurring
+
+    def get_recurring_income(self, recurring_id: str) -> Optional[RecurringIncome]:
+        for r in self.list_recurring_income():
+            if r.id == recurring_id:
+                return r
+        return None
+
+    def save_recurring_income(self, recurring: RecurringIncome) -> RecurringIncome:
+        recurrings = self.list_recurring_income()
+        found = False
+        for idx, r in enumerate(recurrings):
+            if r.id == recurring.id:
+                recurrings[idx] = recurring
+                found = True
+                break
+        if not found:
+            recurrings.append(recurring)
+        self._write_json(self._recurring_income_file, [r.model_dump() for r in recurrings])
+        return recurring
+
+    def delete_recurring_income(self, recurring_id: str) -> bool:
+        recurrings = self.list_recurring_income()
+        new_recurrings = [r for r in recurrings if r.id != recurring_id]
+        if len(new_recurrings) == len(recurrings):
+            return False
+        self._write_json(self._recurring_income_file, [r.model_dump() for r in new_recurrings])
         return True

@@ -200,14 +200,20 @@ class TestCSVImport:
 
 class TestSpendingTrends:
     def test_trends_with_data(self, svc):
+        # Use explicit dates so the test is deterministic regardless of
+        # when it runs.  Current period = this month, previous = last month.
         today = date.today()
+        # Previous month's same day (clamped to 28 to avoid month-length issues).
+        if today.month == 1:
+            prev = today.replace(year=today.year - 1, month=12, day=min(today.day, 28))
+        else:
+            prev = today.replace(month=today.month - 1, day=min(today.day, 28))
         # Current period expenses
         svc.add_expense(amount=300, category="api", expense_date=today)
         svc.add_expense(amount=200, category="infra", expense_date=today)
         # Previous period expenses
-        prev_month = today - timedelta(days=35)
-        svc.add_expense(amount=200, category="api", expense_date=prev_month)
-        svc.add_expense(amount=150, category="infra", expense_date=prev_month)
+        svc.add_expense(amount=200, category="api", expense_date=prev)
+        svc.add_expense(amount=150, category="infra", expense_date=prev)
 
         trends = svc.get_spending_trends()
         assert len(trends) >= 2
@@ -218,7 +224,11 @@ class TestSpendingTrends:
     def test_trends_single_category(self, svc):
         today = date.today()
         svc.add_expense(amount=300, category="api", expense_date=today)
-        svc.add_expense(amount=200, category="api", expense_date=today - timedelta(days=35))
+        if today.month == 1:
+            prev = today.replace(year=today.year - 1, month=12, day=min(today.day, 28))
+        else:
+            prev = today.replace(month=today.month - 1, day=min(today.day, 28))
+        svc.add_expense(amount=200, category="api", expense_date=prev)
 
         trends = svc.get_spending_trends(category="api")
         assert len(trends) == 1
@@ -227,7 +237,11 @@ class TestSpendingTrends:
     def test_trends_flat(self, svc):
         today = date.today()
         svc.add_expense(amount=100, category="api", expense_date=today)
-        svc.add_expense(amount=99, category="api", expense_date=today - timedelta(days=35))
+        if today.month == 1:
+            prev = today.replace(year=today.year - 1, month=12, day=min(today.day, 28))
+        else:
+            prev = today.replace(month=today.month - 1, day=min(today.day, 28))
+        svc.add_expense(amount=99, category="api", expense_date=prev)
 
         trends = svc.get_spending_trends()
         api_trend = next(t for t in trends if t.category == "api")
@@ -236,7 +250,11 @@ class TestSpendingTrends:
     def test_trends_decrease(self, svc):
         today = date.today()
         svc.add_expense(amount=100, category="api", expense_date=today)
-        svc.add_expense(amount=300, category="api", expense_date=today - timedelta(days=35))
+        if today.month == 1:
+            prev = today.replace(year=today.year - 1, month=12, day=min(today.day, 28))
+        else:
+            prev = today.replace(month=today.month - 1, day=min(today.day, 28))
+        svc.add_expense(amount=300, category="api", expense_date=prev)
 
         trends = svc.get_spending_trends()
         api_trend = next(t for t in trends if t.category == "api")
