@@ -381,6 +381,111 @@ class SpendingRule(BaseModel):
         return None
 
 
+# --- v0.5.0 Cost Guardrail Models ---
+
+
+class GuardrailScope(str, Enum):
+    """Scope at which a guardrail applies."""
+    GLOBAL = "global"
+    AGENT = "agent"
+    MODEL = "model"
+    BUDGET = "budget"
+    TASK = "task"
+
+
+class GuardrailAction(str, Enum):
+    """What happens when a guardrail is breached."""
+    ALLOW = "allow"           # spending within limits, all clear
+    WARN = "warn"             # approaching limit, warn but allow
+    THROTTLE = "throttle"     # slow down — deny until cooldown passes
+    BLOCK = "block"           # hard block this call
+    KILL = "kill"             # kill switch active, all calls denied
+
+
+class CostGuardrail(BaseModel):
+    """A cost guardrail that enforces spending limits for agents in real time.
+
+    Unlike spending rules (which check at expense-add time), guardrails are
+    checked *before* an LLM call is made — a pre-flight check that returns
+    allow/deny + reason, enabling agents to self-regulate.
+    """
+    id: str = Field(default_factory=lambda: f"GDR-{uuid.uuid4().hex[:8].upper()}")
+    name: str = Field(min_length=1, description="Guardrail name (e.g., 'Daily LLM cap')")
+    scope: GuardrailScope = Field(description="Scope: global, agent, model, budget, task")
+    scope_id: Optional[str] = Field(default=None, description="ID for scoped guardrails (agent_id, model_id, budget_id, task_id)")
+    daily_limit_usd: Optional[float] = Field(default=None, ge=0, description="Hard daily spend limit in USD")
+    hourly_limit_usd: Optional[float] = Field(default=None, ge=0, description="Hard hourly spend limit in USD")
+    per_call_limit_usd: Optional[float] = Field(default=None, ge=0, description="Max cost per single LLM call")
+    monthly_limit_usd: Optional[float] = Field(default=None, ge=0, description="Hard monthly spend limit")
+    warn_at_percent: float = Field(default=80.0, ge=0, le=100, description="Percent of limit to warn at")
+    block_at_percent: float = Field(default=100.0, ge=0, le=100, description="Percent of limit to block at")
+    cooldown_minutes: int = Field(default=0, ge=0, description="If breached, block calls for N minutes")
+    enabled: bool = Field(default=True)
+    priority: int = Field(default=0, ge=0, description="Higher priority checked first")
+    description: str = Field(default="")
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+    def matches(self, scope: GuardrailScope, scope_id: Optional[str] = None) -> bool:
+        """Check if this guardrail matches the given scope."""
+        if not self.enabled:
+            return False
+        if self.scope != scope:
+            return False
+        if self.scope == GuardrailScope.GLOBAL:
+            return True
+        if scope_id and self.scope_id:
+            return self.scope_id.lower() == scope_id.lower()
+        return self.scope_id is None
+
+
+class GuardrailDecision(BaseModel):
+    """Result of a guardrail pre-flight check."""
+    allowed: bool = Field(description="Whether the LLM call is allowed")
+    action: GuardrailAction = Field(description="Recommended action")
+    reason: str = Field(default="", description="Human-readable reason")
+    guardrail_id: Optional[str] = Field(default=None, description="ID of the guardrail that triggered")
+    current_spend_usd: float = Field(default=0.0, description="Current spend in the relevant period")
+    limit_usd: Optional[float] = Field(default=None, description="The limit that was checked")
+    percent_used: float = Field(default=0.0, description="Percent of limit used")
+    cooldown_until: Optional[datetime] = Field(default=None, description="If in cooldown, when it expires")
+    suggestions: list[str] = Field(default_factory=list, description="Cost-saving suggestions")
+
+
+class KillSwitch(BaseModel):
+    """Emergency kill switch state — when active, all LLM calls are blocked."""
+    active: bool = Field(default=False, description="Whether the kill switch is currently active")
+    reason: str = Field(default="", description="Why the kill switch was triggered")
+    triggered_at: Optional[datetime] = Field(default=None, description="When it was activated")
+    triggered_by: Optional[str] = Field(default=None, description="Who/what triggered it")
+    expires_at: Optional[datetime] = Field(default=None, description="When it auto-resets (None = manual reset only)")
+    override_token: Optional[str] = Field(default=None, description="Token required to reset (for safety)")
+    breach_count: int = Field(default=0, description="Total times auto-triggered")
+
+    def is_active(self, now: Optional[datetime] = None) -> bool:
+        """Check if kill switch is currently active (and not expired)."""
+        if not self.active:
+            return False
+        now = now or datetime.now(timezone.utc)
+        if self.expires_at and now > self.expires_at:
+            return False
+        return True
+
+
+class CostAlertEvent(BaseModel):
+    """A cost alert event triggered by guardrails (separate from budget alerts)."""
+    id: str = Field(default_factory=lambda: f"CST-{uuid.uuid4().hex[:8].upper()}")
+    guardrail_id: Optional[str] = Field(default=None, description="Guardrail that triggered this")
+    scope: GuardrailScope = Field(default=GuardrailScope.GLOBAL)
+    scope_id: Optional[str] = Field(default=None)
+    level: AlertLevel = Field(default=AlertLevel.WARNING)
+    message: str = Field(default="")
+    current_spend_usd: float = Field(default=0.0)
+    limit_usd: Optional[float] = Field(default=None)
+    triggered_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    acknowledged: bool = Field(default=False)
+
+
 class CurrencyInfo(BaseModel):
     """Currency metadata."""
     code: str

@@ -12,7 +12,9 @@ from .models import (
     Budget, Expense, RecurringExpense, BudgetAlert,
     SavingsGoal, SavingsContribution, SpendingRule, BudgetRollover,
     Income, RecurringIncome, IncomeStatus,
+    CostGuardrail, KillSwitch, CostAlertEvent,
 )
+from .llm_costs import LLMUsageRecord, ModelPrice, ModelProvider
 
 
 class BudgetStore:
@@ -31,6 +33,11 @@ class BudgetStore:
         self._templates_file = self.data_dir / "templates.json"
         self._income_file = self.data_dir / "income.json"
         self._recurring_income_file = self.data_dir / "recurring_income.json"
+        self._llm_usage_file = self.data_dir / "llm_usage.json"
+        self._llm_prices_file = self.data_dir / "llm_prices.json"
+        self._guardrails_file = self.data_dir / "guardrails.json"
+        self._killswitch_file = self.data_dir / "killswitch.json"
+        self._cost_alerts_file = self.data_dir / "cost_alerts.json"
 
     # --- JSON helpers ---
 
@@ -431,3 +438,190 @@ class BudgetStore:
             return False
         self._write_json(self._recurring_income_file, [r.model_dump() for r in new_recurrings])
         return True
+
+    # --- LLM Usage Records ---
+
+    def list_llm_usage(
+        self,
+        model_id: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        from_date: Optional[date] = None,
+        to_date: Optional[date] = None,
+        limit: Optional[int] = None,
+    ) -> list[LLMUsageRecord]:
+        """List LLM usage records with optional filters."""
+        data = self._read_json(self._llm_usage_file)
+        records = [LLMUsageRecord(**d) for d in data]
+        if model_id:
+            records = [r for r in records if r.model_id == model_id]
+        if agent_id:
+            records = [r for r in records if r.agent_id == agent_id]
+        if from_date:
+            records = [r for r in records if r.recorded_at.date() >= from_date]
+        if to_date:
+            records = [r for r in records if r.recorded_at.date() <= to_date]
+        records.sort(key=lambda r: r.recorded_at, reverse=True)
+        if limit:
+            records = records[:limit]
+        return records
+
+    def get_llm_usage(self, record_id: str) -> Optional[LLMUsageRecord]:
+        for r in self.list_llm_usage():
+            if r.id == record_id:
+                return r
+        return None
+
+    def save_llm_usage(self, record: LLMUsageRecord) -> LLMUsageRecord:
+        records = self.list_llm_usage()
+        found = False
+        for idx, r in enumerate(records):
+            if r.id == record.id:
+                records[idx] = record
+                found = True
+                break
+        if not found:
+            records.append(record)
+        self._write_json(self._llm_usage_file, [r.model_dump() for r in records])
+        return record
+
+    def delete_llm_usage(self, record_id: str) -> bool:
+        records = self.list_llm_usage()
+        new_records = [r for r in records if r.id != record_id]
+        if len(new_records) == len(records):
+            return False
+        self._write_json(self._llm_usage_file, [r.model_dump() for r in new_records])
+        return True
+
+    # --- Custom Model Prices ---
+
+    def list_custom_prices(self) -> list[ModelPrice]:
+        data = self._read_json(self._llm_prices_file)
+        return [ModelPrice(**d) for d in data]
+
+    def save_custom_price(self, price: ModelPrice) -> ModelPrice:
+        prices = self.list_custom_prices()
+        found = False
+        for idx, p in enumerate(prices):
+            if p.model_id == price.model_id:
+                prices[idx] = price
+                found = True
+                break
+        if not found:
+            prices.append(price)
+        self._write_json(self._llm_prices_file, [p.model_dump() for p in prices])
+        return price
+
+    def delete_custom_price(self, model_id: str) -> bool:
+        prices = self.list_custom_prices()
+        new_prices = [p for p in prices if p.model_id != model_id]
+        if len(new_prices) == len(prices):
+            return False
+        self._write_json(self._llm_prices_file, [p.model_dump() for p in new_prices])
+        return True
+
+    # --- Cost Guardrails (v0.5.0) ---
+
+    def list_guardrails(self, enabled_only: bool = False) -> list[CostGuardrail]:
+        data = self._read_json(self._guardrails_file)
+        guardrails = [CostGuardrail(**d) for d in data]
+        if enabled_only:
+            guardrails = [g for g in guardrails if g.enabled]
+        return sorted(guardrails, key=lambda g: g.priority, reverse=True)
+
+    def get_guardrail(self, guardrail_id: str) -> Optional[CostGuardrail]:
+        for g in self.list_guardrails():
+            if g.id == guardrail_id:
+                return g
+        return None
+
+    def save_guardrail(self, guardrail: CostGuardrail) -> CostGuardrail:
+        guardrails = self.list_guardrails()
+        found = False
+        for idx, g in enumerate(guardrails):
+            if g.id == guardrail.id:
+                guardrails[idx] = guardrail
+                found = True
+                break
+        if not found:
+            guardrails.append(guardrail)
+        self._write_json(self._guardrails_file, [g.model_dump() for g in guardrails])
+        return guardrail
+
+    def delete_guardrail(self, guardrail_id: str) -> bool:
+        guardrails = self.list_guardrails()
+        new_guardrails = [g for g in guardrails if g.id != guardrail_id]
+        if len(new_guardrails) == len(guardrails):
+            return False
+        self._write_json(self._guardrails_file, [g.model_dump() for g in new_guardrails])
+        return True
+
+    # --- Kill Switch ---
+
+    def get_kill_switch(self) -> KillSwitch:
+        """Get current kill switch state. Returns inactive if not set."""
+        if not self._killswitch_file.exists():
+            return KillSwitch()
+        try:
+            with open(self._killswitch_file) as f:
+                data = json.load(f)
+            return KillSwitch(**data)
+        except (json.JSONDecodeError, IOError, TypeError):
+            return KillSwitch()
+
+    def save_kill_switch(self, ks: KillSwitch) -> KillSwitch:
+        """Persist kill switch state."""
+        with open(self._killswitch_file, "w") as f:
+            json.dump(ks.model_dump(), f, indent=2, default=self._json_default)
+        return ks
+
+    # --- Cost Alert Events ---
+
+    def list_cost_alerts(
+        self,
+        guardrail_id: Optional[str] = None,
+        unacknowledged_only: bool = False,
+        limit: Optional[int] = None,
+    ) -> list[CostAlertEvent]:
+        data = self._read_json(self._cost_alerts_file)
+        alerts = [CostAlertEvent(**d) for d in data]
+        if guardrail_id:
+            alerts = [a for a in alerts if a.guardrail_id == guardrail_id]
+        if unacknowledged_only:
+            alerts = [a for a in alerts if not a.acknowledged]
+        alerts.sort(key=lambda a: a.triggered_at, reverse=True)
+        if limit:
+            alerts = alerts[:limit]
+        return alerts
+
+    def save_cost_alert(self, alert: CostAlertEvent) -> CostAlertEvent:
+        alerts = self.list_cost_alerts()
+        found = False
+        for idx, a in enumerate(alerts):
+            if a.id == alert.id:
+                alerts[idx] = alert
+                found = True
+                break
+        if not found:
+            alerts.append(alert)
+        self._write_json(self._cost_alerts_file, [a.model_dump() for a in alerts])
+        return alert
+
+    def acknowledge_cost_alert(self, alert_id: str) -> Optional[CostAlertEvent]:
+        alerts = self.list_cost_alerts()
+        for idx, a in enumerate(alerts):
+            if a.id == alert_id:
+                a.acknowledged = True
+                alerts[idx] = a
+                self._write_json(self._cost_alerts_file, [a.model_dump() for a in alerts])
+                return a
+        return None
+
+    def clear_cost_alerts(self, guardrail_id: Optional[str] = None) -> int:
+        alerts = self.list_cost_alerts()
+        if guardrail_id:
+            new_alerts = [a for a in alerts if a.guardrail_id != guardrail_id]
+        else:
+            new_alerts = []
+        cleared = len(alerts) - len(new_alerts)
+        self._write_json(self._cost_alerts_file, [a.model_dump() for a in new_alerts])
+        return cleared

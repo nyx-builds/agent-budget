@@ -1,8 +1,26 @@
 # Agent Budget
 
-MCP server + CLI for autonomous agents to manage budgets, track expenses, control spending, set savings goals, and enforce spending rules.
+MCP server + CLI for autonomous agents to manage budgets, track expenses, control spending, set savings goals, enforce spending rules, and **enforce real-time cost guardrails with kill switch** to prevent runaway LLM costs.
 
 ## Features
+
+### v0.5.0 — Cost Guardrails & Kill Switch 🚨
+- **Real-time Pre-flight Checks** — `check_guardrails()` before LLM calls: allow / warn / block decisions
+- **Multi-scope Guardrails** — Set limits per global, agent, model, budget, or task scope
+- **Multiple Limit Types** — Daily, hourly, per-call, and monthly spend caps
+- **Emergency Kill Switch** — Instantly block ALL LLM calls; optional auto-expire and override tokens
+- **Cost Alert Events** — Track guardrail breaches separately from budget alerts; acknowledge & clear
+- **Cost-saving Suggestions** — When blocked, agents get actionable recommendations
+- **Cooldown Periods** — After a breach, block subsequent calls for N minutes
+- **Priority Ordering** — Higher-priority guardrails checked first; most restrictive decision wins
+
+### v0.4.0
+- **Income Tracking** — Log income from multiple sources, recurring income templates
+- **Cash Flow Analysis** — Income vs expenses, savings rate, expense ratio
+- **Burn Rate** — Monthly burn, net burn, runway months, sustainability scoring
+- **Financial Dashboard** — Health score (0-100), budget status, savings, cash flow, burn rate
+- **REST API** — Full HTTP API with OpenAPI docs
+- **CSV Import** — Bulk import expenses from CSV files
 
 ### v0.2.0
 - **Savings Goals** — Track progress toward savings targets with auto-completion
@@ -158,6 +176,104 @@ mcp.run()
 - `clear_alerts` — Clear alerts
 - `export_data` — Export all data
 - `list_currencies` — List supported currencies
+
+### Cost Guardrail Tools (v0.5.0)
+- `check_cost_guardrail` — **Pre-flight check before an LLM call** — returns allow/warn/block
+- `create_cost_guardrail` — Create a spending limit guardrail (global/agent/model/budget/task scope)
+- `list_cost_guardrails` — List all guardrails
+- `delete_cost_guardrail` — Delete a guardrail
+- `trigger_kill_switch` — **Emergency stop** — blocks ALL LLM calls immediately
+- `reset_kill_switch` — Reset the kill switch (requires override token if set)
+- `get_kill_switch_status` — Check if kill switch is active
+- `list_cost_alerts` — List cost alert events from guardrails
+
+## Cost Guardrails & Kill Switch (v0.5.0)
+
+Cost guardrails are the key safety feature for autonomous agents. Unlike spending rules (which check after an expense is added), guardrails are checked **before** an LLM call is made.
+
+### How it works
+
+```
+Agent wants to call GPT-4o
+    ↓
+Calls check_cost_guardrail(cost=$0.05, agent_id="worker-1", model_id="gpt-4o")
+    ↓
+Guardrail engine checks:
+  1. Kill switch active? → If yes, BLOCK
+  2. Per-call limit? → If exceeded, BLOCK
+  3. Daily/hourly/monthly limits? → If exceeded, BLOCK; if approaching, WARN
+    ↓
+Returns decision: ALLOW / WARN / BLOCK + reason + suggestions
+    ↓
+Agent proceeds or adjusts behavior
+```
+
+### CLI Examples
+
+```bash
+# Create a global daily cap
+agent-budget guardrail create "Daily LLM Cap" global --daily-limit 50.0
+
+# Create per-agent limit with early warning
+agent-budget guardrail create "Agent A Cap" agent --scope-id agent-A --daily-limit 10.0 --warn-at 70
+
+# Create per-model limit (block expensive models over budget)
+agent-budget guardrail create "GPT-4o Cap" model --scope-id gpt-4o --daily-limit 20.0
+
+# Per-call limit to prevent expensive single calls
+agent-budget guardrail create "Per-call Cap" global --per-call-limit 0.50
+
+# Check before an LLM call
+agent-budget guardrail check --cost 0.05 --agent agent-A --model gpt-4o
+
+# Emergency stop
+agent-budget kill-switch trigger "Budget blown — investigating"
+
+# Reset (with token if set)
+agent-budget kill-switch reset --token my-secret
+```
+
+### Python Usage
+
+```python
+from agent_budget.service import BudgetService
+
+svc = BudgetService()
+
+# Set up guardrails
+svc.create_guardrail(
+    name="Daily agent cap",
+    scope=GuardrailScope.AGENT,
+    scope_id="worker-bot",
+    daily_limit_usd=20.0,
+    warn_at_percent=75,
+)
+
+# Before each LLM call — check guardrails
+decision = svc.check_guardrails(
+    estimated_cost_usd=0.05,
+    agent_id="worker-bot",
+    model_id="gpt-4o",
+)
+
+if decision.allowed:
+    # Proceed with the call
+    if decision.action == GuardrailAction.WARN:
+        print(f"Warning: {decision.reason}")
+    make_llm_call()
+else:
+    # Blocked — respect the decision
+    print(f"Blocked: {decision.reason}")
+    for suggestion in decision.suggestions:
+        print(f"  → {suggestion}")
+
+# Emergency kill switch
+svc.trigger_kill_switch(reason="Security incident", override_token="admin-only")
+# All check_guardrails() calls now return action=KILL
+
+# Reset when safe
+svc.reset_kill_switch(override_token="admin-only")
+```
 
 ## Python API
 

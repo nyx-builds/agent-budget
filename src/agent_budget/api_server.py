@@ -967,6 +967,117 @@ def create_app() -> FastAPI:
     async def value_error_handler(request: Request, exc: ValueError):
         return JSONResponse(status_code=400, content={"detail": str(exc)})
 
+    # -- v0.5.0: Cost Guardrails & Kill Switch -------------------------
+
+    @app.post("/guardrails")
+    def create_guardrail(body: dict):
+        """Create a cost guardrail."""
+        from .models import GuardrailScope as GS
+        svc = get_service()
+        g = svc.create_guardrail(
+            name=body["name"],
+            scope=GS(body["scope"]),
+            scope_id=body.get("scope_id"),
+            daily_limit_usd=body.get("daily_limit_usd"),
+            hourly_limit_usd=body.get("hourly_limit_usd"),
+            per_call_limit_usd=body.get("per_call_limit_usd"),
+            monthly_limit_usd=body.get("monthly_limit_usd"),
+            warn_at_percent=body.get("warn_at_percent", 80.0),
+            block_at_percent=body.get("block_at_percent", 100.0),
+            cooldown_minutes=body.get("cooldown_minutes", 0),
+            enabled=body.get("enabled", True),
+            priority=body.get("priority", 0),
+            description=body.get("description", ""),
+        )
+        return g.model_dump(mode="json")
+
+    @app.get("/guardrails")
+    def list_guardrails(enabled_only: bool = True):
+        svc = get_service()
+        return [g.model_dump(mode="json") for g in svc.list_guardrails(enabled_only=enabled_only)]
+
+    @app.get("/guardrails/{guardrail_id}")
+    def get_guardrail(guardrail_id: str):
+        svc = get_service()
+        g = svc.get_guardrail(guardrail_id)
+        if not g:
+            raise HTTPException(status_code=404, detail="Guardrail not found")
+        return g.model_dump(mode="json")
+
+    @app.delete("/guardrails/{guardrail_id}")
+    def delete_guardrail(guardrail_id: str):
+        svc = get_service()
+        deleted = svc.delete_guardrail(guardrail_id)
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Guardrail not found")
+        return {"deleted": True, "guardrail_id": guardrail_id}
+
+    @app.post("/guardrails/check")
+    def check_guardrails(body: dict):
+        """Pre-flight check: should the agent proceed with this LLM call?"""
+        svc = get_service()
+        decision = svc.check_guardrails(
+            estimated_cost_usd=body.get("estimated_cost_usd", 0.0),
+            agent_id=body.get("agent_id"),
+            model_id=body.get("model_id"),
+            budget_id=body.get("budget_id"),
+            task_id=body.get("task_id"),
+        )
+        return decision.model_dump(mode="json")
+
+    @app.post("/kill-switch/trigger")
+    def trigger_kill_switch(body: dict):
+        svc = get_service()
+        ks = svc.trigger_kill_switch(
+            reason=body["reason"],
+            triggered_by=body.get("triggered_by"),
+            expires_in_minutes=body.get("expires_in_minutes"),
+            override_token=body.get("override_token"),
+        )
+        return ks.model_dump(mode="json")
+
+    @app.post("/kill-switch/reset")
+    def reset_kill_switch(body: Optional[dict] = None):
+        svc = get_service()
+        body = body or {}
+        try:
+            ks = svc.reset_kill_switch(override_token=body.get("override_token"))
+            return ks.model_dump(mode="json")
+        except ValueError as e:
+            raise HTTPException(status_code=403, detail=str(e))
+
+    @app.get("/kill-switch/status")
+    def kill_switch_status():
+        svc = get_service()
+        return svc.get_kill_switch_status().model_dump(mode="json")
+
+    @app.get("/cost-alerts")
+    def list_cost_alerts(
+        guardrail_id: Optional[str] = None,
+        unacknowledged_only: bool = False,
+        limit: int = 50,
+    ):
+        svc = get_service()
+        return [a.model_dump(mode="json") for a in svc.list_cost_alerts(
+            guardrail_id=guardrail_id,
+            unacknowledged_only=unacknowledged_only,
+            limit=limit,
+        )]
+
+    @app.post("/cost-alerts/{alert_id}/ack")
+    def acknowledge_cost_alert(alert_id: str):
+        svc = get_service()
+        alert = svc.acknowledge_cost_alert(alert_id)
+        if not alert:
+            raise HTTPException(status_code=404, detail="Alert not found")
+        return alert.model_dump(mode="json")
+
+    @app.delete("/cost-alerts")
+    def clear_cost_alerts(guardrail_id: Optional[str] = None):
+        svc = get_service()
+        count = svc.clear_cost_alerts(guardrail_id=guardrail_id)
+        return {"cleared": count}
+
     return app
 
 

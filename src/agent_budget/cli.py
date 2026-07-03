@@ -17,6 +17,7 @@ from .models import (
     SpendingRuleAction, SavingsGoalStatus,
     SUPPORTED_CURRENCIES, format_currency,
     IncomeStatus,
+    GuardrailScope,
 )
 from .service import BudgetService
 from .store import BudgetStore
@@ -1508,6 +1509,267 @@ def serve_cmd():
     from .mcp_server import run_server
     console.print("[bold green]Starting Agent Budget MCP server...[/bold green]")
     run_server()
+
+
+# --- v0.5.0: Cost Guardrails & Kill Switch ---
+
+@main.group("guardrail")
+def guardrail_group():
+    """Cost guardrail management — pre-flight checks before LLM calls."""
+    pass
+
+
+@guardrail_group.command("create")
+@click.argument("name")
+@click.argument("scope", type=click.Choice([s.value for s in GuardrailScope]))
+@click.option("--scope-id", default=None, help="ID for scoped guardrails (agent_id, model_id, etc.)")
+@click.option("--daily-limit", type=float, default=None, help="Daily spend limit in USD")
+@click.option("--hourly-limit", type=float, default=None, help="Hourly spend limit in USD")
+@click.option("--per-call-limit", type=float, default=None, help="Max cost per single LLM call")
+@click.option("--monthly-limit", type=float, default=None, help="Monthly spend limit in USD")
+@click.option("--warn-at", type=float, default=80.0, help="Percent to start warning (default 80)")
+@click.option("--block-at", type=float, default=100.0, help="Percent to block at (default 100)")
+@click.option("--cooldown", type=int, default=0, help="Cooldown minutes after breach")
+@click.option("--priority", type=int, default=0, help="Priority (higher checked first)")
+@click.option("--disabled", is_flag=True, help="Create as disabled")
+@click.option("--description", "-d", default="", help="Description")
+def guardrail_create(name, scope, scope_id, daily_limit, hourly_limit, per_call_limit,
+                     monthly_limit, warn_at, block_at, cooldown, priority, disabled, description):
+    """Create a cost guardrail."""
+    svc = get_service()
+    try:
+        g = svc.create_guardrail(
+            name=name,
+            scope=GuardrailScope(scope),
+            scope_id=scope_id,
+            daily_limit_usd=daily_limit,
+            hourly_limit_usd=hourly_limit,
+            per_call_limit_usd=per_call_limit,
+            monthly_limit_usd=monthly_limit,
+            warn_at_percent=warn_at,
+            block_at_percent=block_at,
+            cooldown_minutes=cooldown,
+            enabled=not disabled,
+            priority=priority,
+            description=description,
+        )
+        console.print(f"[bold green]✓ Created guardrail:[/bold green] {g.id}")
+        console.print(f"  Name: {g.name}")
+        console.print(f"  Scope: {g.scope.value}" + (f" ({g.scope_id})" if g.scope_id else ""))
+        if g.daily_limit_usd: console.print(f"  Daily Limit: ${g.daily_limit_usd:.2f}")
+        if g.hourly_limit_usd: console.print(f"  Hourly Limit: ${g.hourly_limit_usd:.2f}")
+        if g.per_call_limit_usd: console.print(f"  Per-Call Limit: ${g.per_call_limit_usd:.4f}")
+        if g.monthly_limit_usd: console.print(f"  Monthly Limit: ${g.monthly_limit_usd:.2f}")
+        console.print(f"  Warn at {g.warn_at_percent}%, Block at {g.block_at_percent}%")
+    except ValueError as e:
+        console.print(f"[bold red]Error:[/bold red] {e}")
+        sys.exit(1)
+
+
+@guardrail_group.command("list")
+@click.option("--all", "show_all", is_flag=True, help="Show disabled guardrails too")
+def guardrail_list(show_all):
+    """List all cost guardrails."""
+    svc = get_service()
+    guardrails = svc.list_guardrails(enabled_only=not show_all)
+    if not guardrails:
+        console.print("[dim]No guardrails configured.[/dim]")
+        return
+
+    table = Table(title="Cost Guardrails")
+    table.add_column("ID", style="cyan")
+    table.add_column("Name", style="white")
+    table.add_column("Scope", style="yellow")
+    table.add_column("Daily", justify="right")
+    table.add_column("Hourly", justify="right")
+    table.add_column("Per-Call", justify="right")
+    table.add_column("Monthly", justify="right")
+    table.add_column("Status", style="green")
+
+    for g in guardrails:
+        status = "[green]enabled[/green]" if g.enabled else "[red]disabled[/red]"
+        scope_str = g.scope.value + (f"={g.scope_id}" if g.scope_id else "")
+        table.add_row(
+            g.id, g.name, scope_str,
+            f"${g.daily_limit_usd:.2f}" if g.daily_limit_usd else "-",
+            f"${g.hourly_limit_usd:.2f}" if g.hourly_limit_usd else "-",
+            f"${g.per_call_limit_usd:.4f}" if g.per_call_limit_usd else "-",
+            f"${g.monthly_limit_usd:.2f}" if g.monthly_limit_usd else "-",
+            status,
+        )
+    console.print(table)
+
+
+@guardrail_group.command("delete")
+@click.argument("guardrail_id")
+def guardrail_delete(guardrail_id):
+    """Delete a cost guardrail."""
+    svc = get_service()
+    if svc.delete_guardrail(guardrail_id):
+        console.print(f"[bold green]✓ Deleted guardrail:[/bold green] {guardrail_id}")
+    else:
+        console.print(f"[bold red]Not found:[/bold red] {guardrail_id}")
+        sys.exit(1)
+
+
+@guardrail_group.command("check")
+@click.option("--cost", type=float, default=0.0, help="Estimated cost of the LLM call")
+@click.option("--agent", "agent_id", default=None, help="Agent ID")
+@click.option("--model", "model_id", default=None, help="Model ID")
+@click.option("--budget", "budget_id", default=None, help="Budget ID")
+@click.option("--task", "task_id", default=None, help="Task ID")
+def guardrail_check(cost, agent_id, model_id, budget_id, task_id):
+    """Pre-flight check: should the agent proceed with this LLM call?"""
+    svc = get_service()
+    decision = svc.check_guardrails(
+        estimated_cost_usd=cost,
+        agent_id=agent_id,
+        model_id=model_id,
+        budget_id=budget_id,
+        task_id=task_id,
+    )
+
+    if decision.allowed:
+        if decision.action.value == "warn":
+            console.print(f"[bold yellow]⚠️  WARN:[/bold yellow] {decision.reason}")
+        else:
+            console.print(f"[bold green]✓ ALLOWED:[/bold green] {decision.reason}")
+    else:
+        console.print(f"[bold red]🚫 BLOCKED:[/bold red] {decision.reason}")
+        if decision.suggestions:
+            console.print("\n[bold]Suggestions:[/bold]")
+            for s in decision.suggestions:
+                console.print(f"  • {s}")
+        if decision.cooldown_until:
+            console.print(f"\nCooldown until: {decision.cooldown_until}")
+        sys.exit(1)
+
+
+@main.group("kill-switch")
+def kill_switch_group():
+    """Emergency kill switch — blocks ALL LLM calls when active."""
+    pass
+
+
+@kill_switch_group.command("status")
+def kill_switch_status():
+    """Check kill switch status."""
+    svc = get_service()
+    ks = svc.get_kill_switch_status()
+    if ks.is_active():
+        console.print(f"[bold red]🚨 KILL SWITCH ACTIVE[/bold red]")
+        console.print(f"  Reason: {ks.reason}")
+        console.print(f"  Triggered by: {ks.triggered_by or 'unknown'}")
+        console.print(f"  Triggered at: {ks.triggered_at}")
+        if ks.expires_at:
+            console.print(f"  Expires at: {ks.expires_at}")
+        console.print(f"  Total breaches: {ks.breach_count}")
+    else:
+        console.print(f"[bold green]✓ Kill switch inactive[/bold green] — LLM calls allowed")
+        if ks.breach_count:
+            console.print(f"  (Total breaches: {ks.breach_count})")
+
+
+@kill_switch_group.command("trigger")
+@click.argument("reason")
+@click.option("--by", "triggered_by", default=None, help="Who is triggering it")
+@click.option("--expires", type=int, default=None, help="Auto-reset after N minutes")
+@click.option("--token", default=None, help="Override token required to reset")
+def kill_switch_trigger(reason, triggered_by, expires, token):
+    """Trigger the emergency kill switch."""
+    svc = get_service()
+    ks = svc.trigger_kill_switch(
+        reason=reason,
+        triggered_by=triggered_by,
+        expires_in_minutes=expires,
+        override_token=token,
+    )
+    console.print(f"[bold red]🚨 KILL SWITCH TRIGGERED[/bold red]")
+    console.print(f"  All LLM calls are now blocked.")
+    console.print(f"  Reason: {ks.reason}")
+    if token:
+        console.print(f"  [yellow]Override token set — required to reset[/yellow]")
+
+
+@kill_switch_group.command("reset")
+@click.option("--token", default=None, help="Override token (if set)")
+def kill_switch_reset(token):
+    """Reset the kill switch."""
+    svc = get_service()
+    try:
+        ks = svc.reset_kill_switch(override_token=token)
+        console.print(f"[bold green]✓ Kill switch reset[/bold green] — LLM calls allowed again")
+    except ValueError as e:
+        console.print(f"[bold red]Error:[/bold red] {e}")
+        sys.exit(1)
+
+
+@main.group("cost-alerts")
+def cost_alerts_group():
+    """Cost alert events from guardrails."""
+    pass
+
+
+@cost_alerts_group.command("list")
+@click.option("--guardrail", default=None, help="Filter by guardrail ID")
+@click.option("--unack", "unacknowledged_only", is_flag=True, help="Only unacknowledged")
+@click.option("--limit", default=50, type=int, help="Max results")
+def cost_alerts_list(guardrail, unacknowledged_only, limit):
+    """List cost alert events."""
+    svc = get_service()
+    alerts = svc.list_cost_alerts(
+        guardrail_id=guardrail,
+        unacknowledged_only=unacknowledged_only,
+        limit=limit,
+    )
+    if not alerts:
+        console.print("[dim]No cost alerts.[/dim]")
+        return
+
+    table = Table(title="Cost Alerts")
+    table.add_column("ID", style="cyan")
+    table.add_column("Level", style="yellow")
+    table.add_column("Message", style="white")
+    table.add_column("Spend", justify="right")
+    table.add_column("Limit", justify="right")
+    table.add_column("Time", style="dim")
+    table.add_column("Status")
+
+    for a in alerts:
+        level_color = {"info": "blue", "warning": "yellow", "critical": "red"}.get(a.level.value, "white")
+        status = "[green]acked[/green]" if a.acknowledged else "[red]new[/red]"
+        table.add_row(
+            a.id,
+            f"[{level_color}]{a.level.value}[/{level_color}]",
+            a.message[:60] + ("..." if len(a.message) > 60 else ""),
+            f"${a.current_spend_usd:.2f}",
+            f"${a.limit_usd:.2f}" if a.limit_usd else "-",
+            a.triggered_at.strftime("%Y-%m-%d %H:%M"),
+            status,
+        )
+    console.print(table)
+
+
+@cost_alerts_group.command("ack")
+@click.argument("alert_id")
+def cost_alerts_ack(alert_id):
+    """Acknowledge a cost alert."""
+    svc = get_service()
+    alert = svc.acknowledge_cost_alert(alert_id)
+    if alert:
+        console.print(f"[bold green]✓ Acknowledged:[/bold green] {alert_id}")
+    else:
+        console.print(f"[bold red]Not found:[/bold red] {alert_id}")
+        sys.exit(1)
+
+
+@cost_alerts_group.command("clear")
+@click.option("--guardrail", default=None, help="Only clear alerts for this guardrail")
+def cost_alerts_clear(guardrail):
+    """Clear cost alerts."""
+    svc = get_service()
+    count = svc.clear_cost_alerts(guardrail_id=guardrail)
+    console.print(f"[bold green]✓ Cleared {count} alert(s)[/bold green]")
 
 
 if __name__ == "__main__":

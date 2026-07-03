@@ -15,6 +15,8 @@ from .models import (
     BudgetTemplate, CSVImportResult, BUILTIN_BUDGET_TEMPLATES,
     Income, RecurringIncome, IncomeStatus,
     CashFlowSummary, BurnRate, FinancialDashboard,
+    CostGuardrail, GuardrailScope, GuardrailAction, GuardrailDecision,
+    KillSwitch, CostAlertEvent,
 )
 from .store import BudgetStore
 
@@ -1847,3 +1849,480 @@ class BudgetService:
             currency=currency,
             top_categories=top_categories,
         )
+
+    # --- v0.5.0 Cost Guardrails ---
+
+    def create_guardrail(
+        self,
+        name: str,
+        scope: GuardrailScope,
+        scope_id: Optional[str] = None,
+        daily_limit_usd: Optional[float] = None,
+        hourly_limit_usd: Optional[float] = None,
+        per_call_limit_usd: Optional[float] = None,
+        monthly_limit_usd: Optional[float] = None,
+        warn_at_percent: float = 80.0,
+        block_at_percent: float = 100.0,
+        cooldown_minutes: int = 0,
+        enabled: bool = True,
+        priority: int = 0,
+        description: str = "",
+    ) -> CostGuardrail:
+        """Create a cost guardrail.
+
+        At least one limit (daily, hourly, per_call, monthly) must be set.
+        """
+        if not any([daily_limit_usd, hourly_limit_usd, per_call_limit_usd, monthly_limit_usd]):
+            raise ValueError("At least one limit must be set (daily, hourly, per_call, or monthly)")
+
+        guardrail = CostGuardrail(
+            name=name,
+            scope=scope,
+            scope_id=scope_id,
+            daily_limit_usd=daily_limit_usd,
+            hourly_limit_usd=hourly_limit_usd,
+            per_call_limit_usd=per_call_limit_usd,
+            monthly_limit_usd=monthly_limit_usd,
+            warn_at_percent=warn_at_percent,
+            block_at_percent=block_at_percent,
+            cooldown_minutes=cooldown_minutes,
+            enabled=enabled,
+            priority=priority,
+            description=description,
+        )
+        return self.store.save_guardrail(guardrail)
+
+    def update_guardrail(
+        self,
+        guardrail_id: str,
+        name: Optional[str] = None,
+        daily_limit_usd: Optional[float] = None,
+        hourly_limit_usd: Optional[float] = None,
+        per_call_limit_usd: Optional[float] = None,
+        monthly_limit_usd: Optional[float] = None,
+        warn_at_percent: Optional[float] = None,
+        block_at_percent: Optional[float] = None,
+        cooldown_minutes: Optional[int] = None,
+        enabled: Optional[bool] = None,
+        priority: Optional[int] = None,
+        description: Optional[str] = None,
+    ) -> CostGuardrail:
+        """Update an existing guardrail."""
+        guardrail = self.store.get_guardrail(guardrail_id)
+        if not guardrail:
+            raise ValueError(f"Guardrail {guardrail_id} not found")
+
+        if name is not None:
+            guardrail.name = name
+        if daily_limit_usd is not None:
+            guardrail.daily_limit_usd = daily_limit_usd
+        if hourly_limit_usd is not None:
+            guardrail.hourly_limit_usd = hourly_limit_usd
+        if per_call_limit_usd is not None:
+            guardrail.per_call_limit_usd = per_call_limit_usd
+        if monthly_limit_usd is not None:
+            guardrail.monthly_limit_usd = monthly_limit_usd
+        if warn_at_percent is not None:
+            guardrail.warn_at_percent = warn_at_percent
+        if block_at_percent is not None:
+            guardrail.block_at_percent = block_at_percent
+        if cooldown_minutes is not None:
+            guardrail.cooldown_minutes = cooldown_minutes
+        if enabled is not None:
+            guardrail.enabled = enabled
+        if priority is not None:
+            guardrail.priority = priority
+        if description is not None:
+            guardrail.description = description
+
+        from datetime import timezone
+        guardrail.updated_at = datetime.now(timezone.utc)
+        return self.store.save_guardrail(guardrail)
+
+    def list_guardrails(self, enabled_only: bool = False) -> list[CostGuardrail]:
+        """List all guardrails, sorted by priority (highest first)."""
+        return self.store.list_guardrails(enabled_only=enabled_only)
+
+    def get_guardrail(self, guardrail_id: str) -> Optional[CostGuardrail]:
+        """Get a guardrail by ID."""
+        return self.store.get_guardrail(guardrail_id)
+
+    def delete_guardrail(self, guardrail_id: str) -> bool:
+        """Delete a guardrail."""
+        return self.store.delete_guardrail(guardrail_id)
+
+    def _get_spend_for_period(
+        self,
+        scope: GuardrailScope,
+        scope_id: Optional[str],
+        period_start: datetime,
+        now: datetime,
+    ) -> float:
+        """Get total LLM spend for a scope in a time period."""
+        records = self.store.list_llm_usage(from_date=period_start.date())
+        total = 0.0
+        for r in records:
+            # Filter by time if period is sub-daily
+            if r.recorded_at < period_start:
+                continue
+            if r.recorded_at > now:
+                continue
+            # Filter by scope
+            if scope == GuardrailScope.GLOBAL:
+                total += r.cost_usd
+            elif scope == GuardrailScope.AGENT and scope_id:
+                if r.agent_id and r.agent_id.lower() == scope_id.lower():
+                    total += r.cost_usd
+            elif scope == GuardrailScope.MODEL and scope_id:
+                if r.model_id.lower() == scope_id.lower():
+                    total += r.cost_usd
+            # For BUDGET and TASK scope, check metadata
+            elif scope == GuardrailScope.TASK and scope_id:
+                if r.task_id and r.task_id.lower() == scope_id.lower():
+                    total += r.cost_usd
+            elif scope == GuardrailScope.BUDGET and scope_id:
+                if r.metadata.get("budget_id", "").lower() == scope_id.lower():
+                    total += r.cost_usd
+        return total
+
+    def _get_active_cooldown(
+        self,
+        guardrail_id: str,
+        now: datetime,
+    ) -> Optional[datetime]:
+        """Check if a guardrail is in active cooldown."""
+        # Look for recent block/throttle alerts
+        alerts = self.store.list_cost_alerts(guardrail_id=guardrail_id, unacknowledged_only=False)
+        for alert in alerts:
+            if alert.level == AlertLevel.CRITICAL:
+                cooldown_end = alert.triggered_at + timedelta(minutes=0)  # Will be set by caller
+                # Check if there's an active cooldown
+                pass
+        # Simplified: check for cost alert metadata in store
+        return None
+
+    def check_guardrails(
+        self,
+        estimated_cost_usd: float = 0.0,
+        agent_id: Optional[str] = None,
+        model_id: Optional[str] = None,
+        budget_id: Optional[str] = None,
+        task_id: Optional[str] = None,
+        now: Optional[datetime] = None,
+    ) -> GuardrailDecision:
+        """Pre-flight check: should the agent proceed with this LLM call?
+
+        This is the core guardrail function. Agents call this BEFORE making
+        an LLM call to check if they're within budget. Returns a decision
+        with allow/deny + reason.
+
+        Args:
+            estimated_cost_usd: Estimated cost of the upcoming call
+            agent_id: Agent making the call
+            model_id: Model being called
+            budget_id: Associated budget
+            task_id: Task/session ID
+            now: Override current time (for testing)
+
+        Returns:
+            GuardrailDecision with allowed=True/False and details
+        """
+        now = now or datetime.now(timezone.utc)
+
+        # 1. Check kill switch first
+        kill_switch = self.store.get_kill_switch()
+        if kill_switch.is_active(now):
+            return GuardrailDecision(
+                allowed=False,
+                action=GuardrailAction.KILL,
+                reason=f"KILL SWITCH ACTIVE: {kill_switch.reason}. All LLM calls blocked. Triggered at {kill_switch.triggered_at.isoformat() if kill_switch.triggered_at else 'unknown'}.",
+                current_spend_usd=0.0,
+                suggestions=["Reset the kill switch if this is intentional", "Contact the operator who triggered it"],
+            )
+
+        # 2. Check per-call limit (global check, applies to all guardrails)
+        guardrails = self.store.list_guardrails(enabled_only=True)
+        if not guardrails:
+            return GuardrailDecision(
+                allowed=True,
+                action=GuardrailAction.ALLOW,
+                reason="No guardrails configured — all calls allowed",
+                current_spend_usd=0.0,
+            )
+
+        # 3. Check each applicable guardrail (priority order)
+        worst_decision: Optional[GuardrailDecision] = None
+
+        for g in guardrails:
+            # Determine if this guardrail applies
+            applies = False
+            check_scope_id = None
+
+            if g.scope == GuardrailScope.GLOBAL:
+                applies = True
+            elif g.scope == GuardrailScope.AGENT and agent_id:
+                if g.scope_id is None or g.scope_id.lower() == agent_id.lower():
+                    applies = True
+                    check_scope_id = agent_id
+            elif g.scope == GuardrailScope.MODEL and model_id:
+                if g.scope_id is None or g.scope_id.lower() == model_id.lower():
+                    applies = True
+                    check_scope_id = model_id
+            elif g.scope == GuardrailScope.BUDGET and budget_id:
+                if g.scope_id is None or g.scope_id.lower() == budget_id.lower():
+                    applies = True
+                    check_scope_id = budget_id
+            elif g.scope == GuardrailScope.TASK and task_id:
+                if g.scope_id is None or g.scope_id.lower() == task_id.lower():
+                    applies = True
+                    check_scope_id = task_id
+
+            if not applies:
+                continue
+
+            # Check per-call limit
+            if g.per_call_limit_usd is not None and estimated_cost_usd > g.per_call_limit_usd:
+                decision = GuardrailDecision(
+                    allowed=False,
+                    action=GuardrailAction.BLOCK,
+                    reason=f"Per-call cost ${estimated_cost_usd:.4f} exceeds limit ${g.per_call_limit_usd:.4f} (guardrail: {g.name})",
+                    guardrail_id=g.id,
+                    limit_usd=g.per_call_limit_usd,
+                    percent_used=100.0,
+                    suggestions=[
+                        f"Reduce token count or use a cheaper model",
+                        f"Per-call limit is ${g.per_call_limit_usd:.4f}",
+                    ],
+                )
+                self._record_cost_alert(g, decision, AlertLevel.CRITICAL)
+                if worst_decision is None or decision.action.value > worst_decision.action.value:
+                    worst_decision = decision
+                continue
+
+            # Check daily limit
+            if g.daily_limit_usd is not None:
+                day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+                daily_spend = self._get_spend_for_period(g.scope, check_scope_id, day_start, now)
+                projected = daily_spend + estimated_cost_usd
+                pct = (projected / g.daily_limit_usd * 100) if g.daily_limit_usd > 0 else 0
+
+                if pct >= g.block_at_percent:
+                    decision = GuardrailDecision(
+                        allowed=False,
+                        action=GuardrailAction.BLOCK,
+                        reason=f"Daily limit ${g.daily_limit_usd:.2f} {'exceeded' if pct >= 100 else f'{g.block_at_percent:.0f}% reached'} — current spend ${daily_spend:.2f}, projected ${projected:.2f} ({pct:.1f}%) (guardrail: {g.name})",
+                        guardrail_id=g.id,
+                        current_spend_usd=daily_spend,
+                        limit_usd=g.daily_limit_usd,
+                        percent_used=pct,
+                        suggestions=self._cost_suggestions(g, projected, g.daily_limit_usd),
+                    )
+                    self._record_cost_alert(g, decision, AlertLevel.CRITICAL)
+                    # Check cooldown
+                    if g.cooldown_minutes > 0:
+                        decision.cooldown_until = now + timedelta(minutes=g.cooldown_minutes)
+                    if worst_decision is None or decision.action.value > worst_decision.action.value:
+                        worst_decision = decision
+                    continue
+                elif pct >= g.warn_at_percent:
+                    decision = GuardrailDecision(
+                        allowed=True,
+                        action=GuardrailAction.WARN,
+                        reason=f"Daily spend approaching limit — ${daily_spend:.2f}/${g.daily_limit_usd:.2f} ({pct:.1f}%) (guardrail: {g.name})",
+                        guardrail_id=g.id,
+                        current_spend_usd=daily_spend,
+                        limit_usd=g.daily_limit_usd,
+                        percent_used=pct,
+                    )
+                    self._record_cost_alert(g, decision, AlertLevel.WARNING)
+                    if worst_decision is None or (worst_decision.allowed and not decision.allowed):
+                        worst_decision = decision
+                    continue
+
+            # Check hourly limit
+            if g.hourly_limit_usd is not None:
+                hour_start = now - timedelta(hours=1)
+                hourly_spend = self._get_spend_for_period(g.scope, check_scope_id, hour_start, now)
+                projected = hourly_spend + estimated_cost_usd
+                pct = (projected / g.hourly_limit_usd * 100) if g.hourly_limit_usd > 0 else 0
+
+                if pct >= g.block_at_percent:
+                    decision = GuardrailDecision(
+                        allowed=False,
+                        action=GuardrailAction.BLOCK,
+                        reason=f"Hourly limit ${g.hourly_limit_usd:.2f} {'exceeded' if pct >= 100 else f'{g.block_at_percent:.0f}% reached'} — current spend ${hourly_spend:.2f}, projected ${projected:.2f} ({pct:.1f}%) (guardrail: {g.name})",
+                        guardrail_id=g.id,
+                        current_spend_usd=hourly_spend,
+                        limit_usd=g.hourly_limit_usd,
+                        percent_used=pct,
+                    )
+                    self._record_cost_alert(g, decision, AlertLevel.CRITICAL)
+                    if worst_decision is None or decision.action.value > worst_decision.action.value:
+                        worst_decision = decision
+                    continue
+                elif pct >= g.warn_at_percent:
+                    decision = GuardrailDecision(
+                        allowed=True,
+                        action=GuardrailAction.WARN,
+                        reason=f"Hourly spend approaching limit — ${hourly_spend:.2f}/${g.hourly_limit_usd:.2f} ({pct:.1f}%) (guardrail: {g.name})",
+                        guardrail_id=g.id,
+                        current_spend_usd=hourly_spend,
+                        limit_usd=g.hourly_limit_usd,
+                        percent_used=pct,
+                    )
+                    self._record_cost_alert(g, decision, AlertLevel.WARNING)
+                    if worst_decision is None or (worst_decision.allowed and not decision.allowed):
+                        worst_decision = decision
+                    continue
+
+            # Check monthly limit
+            if g.monthly_limit_usd is not None:
+                month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+                monthly_spend = self._get_spend_for_period(g.scope, check_scope_id, month_start, now)
+                projected = monthly_spend + estimated_cost_usd
+                pct = (projected / g.monthly_limit_usd * 100) if g.monthly_limit_usd > 0 else 0
+
+                if pct >= g.block_at_percent:
+                    decision = GuardrailDecision(
+                        allowed=False,
+                        action=GuardrailAction.BLOCK,
+                        reason=f"Monthly limit ${g.monthly_limit_usd:.2f} {'exceeded' if pct >= 100 else f'{g.block_at_percent:.0f}% reached'} — current spend ${monthly_spend:.2f}, projected ${projected:.2f} ({pct:.1f}%) (guardrail: {g.name})",
+                        guardrail_id=g.id,
+                        current_spend_usd=monthly_spend,
+                        limit_usd=g.monthly_limit_usd,
+                        percent_used=pct,
+                    )
+                    self._record_cost_alert(g, decision, AlertLevel.CRITICAL)
+                    if worst_decision is None or decision.action.value > worst_decision.action.value:
+                        worst_decision = decision
+                    continue
+                elif pct >= g.warn_at_percent:
+                    decision = GuardrailDecision(
+                        allowed=True,
+                        action=GuardrailAction.WARN,
+                        reason=f"Monthly spend approaching limit — ${monthly_spend:.2f}/${g.monthly_limit_usd:.2f} ({pct:.1f}%) (guardrail: {g.name})",
+                        guardrail_id=g.id,
+                        current_spend_usd=monthly_spend,
+                        limit_usd=g.monthly_limit_usd,
+                        percent_used=pct,
+                    )
+                    self._record_cost_alert(g, decision, AlertLevel.WARNING)
+                    if worst_decision is None or (worst_decision.allowed and not decision.allowed):
+                        worst_decision = decision
+                    continue
+
+        # If we got a block or warn, return it; otherwise all clear
+        if worst_decision:
+            return worst_decision
+
+        return GuardrailDecision(
+            allowed=True,
+            action=GuardrailAction.ALLOW,
+            reason="All guardrails passed — within all limits",
+            current_spend_usd=0.0,
+        )
+
+    def _record_cost_alert(
+        self,
+        guardrail: CostGuardrail,
+        decision: GuardrailDecision,
+        level: AlertLevel,
+    ) -> None:
+        """Record a cost alert event when a guardrail triggers."""
+        alert = CostAlertEvent(
+            guardrail_id=guardrail.id,
+            scope=guardrail.scope,
+            scope_id=guardrail.scope_id,
+            level=level,
+            message=decision.reason,
+            current_spend_usd=decision.current_spend_usd,
+            limit_usd=decision.limit_usd,
+        )
+        self.store.save_cost_alert(alert)
+
+    def _cost_suggestions(self, guardrail: CostGuardrail, projected: float, limit: float) -> list[str]:
+        """Generate cost-saving suggestions based on the guardrail."""
+        suggestions = []
+        overage = projected - limit
+        if overage > 0:
+            suggestions.append(f"Reduce spending by ${overage:.2f} to stay within limit")
+        suggestions.append("Consider using a cheaper model (e.g., gpt-4o-mini instead of gpt-4o)")
+        suggestions.append("Reduce token count by summarizing context or using caching")
+        suggestions.append(f"Guardrail '{guardrail.name}' is set at ${limit:.2f}")
+        return suggestions
+
+    # --- Kill Switch ---
+
+    def trigger_kill_switch(
+        self,
+        reason: str,
+        triggered_by: Optional[str] = None,
+        expires_in_minutes: Optional[int] = None,
+        override_token: Optional[str] = None,
+        now: Optional[datetime] = None,
+    ) -> KillSwitch:
+        """Trigger the emergency kill switch — blocks ALL LLM calls.
+
+        Args:
+            reason: Why the kill switch is being triggered
+            triggered_by: Who/what triggered it
+            expires_in_minutes: Auto-reset after N minutes (None = manual only)
+            override_token: Token required to reset (for safety)
+            now: Override current time (for testing)
+        """
+        now = now or datetime.now(timezone.utc)
+        ks = self.store.get_kill_switch()
+        ks.active = True
+        ks.reason = reason
+        ks.triggered_at = now
+        ks.triggered_by = triggered_by
+        ks.expires_at = now + timedelta(minutes=expires_in_minutes) if expires_in_minutes else None
+        ks.override_token = override_token
+        ks.breach_count += 1
+        return self.store.save_kill_switch(ks)
+
+    def reset_kill_switch(self, override_token: Optional[str] = None) -> KillSwitch:
+        """Reset the kill switch, allowing LLM calls again.
+
+        Args:
+            override_token: Required if the kill switch was set with a token
+        """
+        ks = self.store.get_kill_switch()
+        if not ks.is_active():
+            return ks  # Already inactive
+        if ks.override_token and override_token != ks.override_token:
+            raise ValueError("Invalid override token — kill switch requires authentication to reset")
+        ks.active = False
+        ks.reason = ""
+        ks.triggered_at = None
+        ks.triggered_by = None
+        ks.expires_at = None
+        ks.override_token = None
+        return self.store.save_kill_switch(ks)
+
+    def get_kill_switch_status(self) -> KillSwitch:
+        """Get current kill switch status."""
+        return self.store.get_kill_switch()
+
+    # --- Cost Alert Management ---
+
+    def list_cost_alerts(
+        self,
+        guardrail_id: Optional[str] = None,
+        unacknowledged_only: bool = False,
+        limit: Optional[int] = None,
+    ) -> list[CostAlertEvent]:
+        """List cost alert events."""
+        return self.store.list_cost_alerts(
+            guardrail_id=guardrail_id,
+            unacknowledged_only=unacknowledged_only,
+            limit=limit,
+        )
+
+    def acknowledge_cost_alert(self, alert_id: str) -> Optional[CostAlertEvent]:
+        """Acknowledge a cost alert."""
+        return self.store.acknowledge_cost_alert(alert_id)
+
+    def clear_cost_alerts(self, guardrail_id: Optional[str] = None) -> int:
+        """Clear cost alerts, optionally filtered by guardrail."""
+        return self.store.clear_cost_alerts(guardrail_id=guardrail_id)

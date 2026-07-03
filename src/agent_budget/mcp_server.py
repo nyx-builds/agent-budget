@@ -12,6 +12,7 @@ from .models import (
     BudgetPeriod, RecurringFrequency, SpendingRuleAction,
     SavingsGoalStatus, SUPPORTED_CURRENCIES,
     IncomeStatus,
+    GuardrailScope,
 )
 from .service import BudgetService
 from .store import BudgetStore
@@ -1297,6 +1298,194 @@ def get_financial_dashboard() -> str:
     svc = get_service()
     dashboard = svc.get_financial_dashboard()
     return json.dumps(dashboard.model_dump(), default=str, indent=2)
+
+
+# --- v0.5.0: Cost Guardrail & Kill Switch Tools ---
+
+@mcp.tool()
+def check_cost_guardrail(
+    estimated_cost_usd: float = 0.0,
+    agent_id: str | None = None,
+    model_id: str | None = None,
+    budget_id: str | None = None,
+    task_id: str | None = None,
+) -> str:
+    """Pre-flight check before an LLM call — should the agent proceed?
+
+    Call this BEFORE making an LLM API call to check if you're within budget
+    limits. Returns a decision: allowed (proceed), warn (proceed but slow down),
+    or blocked (do NOT proceed). If blocked, the reason explains which guardrail
+    was triggered and provides cost-saving suggestions.
+
+    Args:
+        estimated_cost_usd: Estimated cost of the upcoming LLM call
+        agent_id: Your agent identifier (for per-agent guardrails)
+        model_id: Model you plan to call (e.g., 'gpt-4o')
+        budget_id: Associated budget ID
+        task_id: Task/session identifier
+    """
+    svc = get_service()
+    decision = svc.check_guardrails(
+        estimated_cost_usd=estimated_cost_usd,
+        agent_id=agent_id,
+        model_id=model_id,
+        budget_id=budget_id,
+        task_id=task_id,
+    )
+    return json.dumps(decision.model_dump(), default=str, indent=2)
+
+
+@mcp.tool()
+def create_cost_guardrail(
+    name: str,
+    scope: str,
+    scope_id: str | None = None,
+    daily_limit_usd: float | None = None,
+    hourly_limit_usd: float | None = None,
+    per_call_limit_usd: float | None = None,
+    monthly_limit_usd: float | None = None,
+    warn_at_percent: float = 80.0,
+    block_at_percent: float = 100.0,
+    cooldown_minutes: int = 0,
+    priority: int = 0,
+    description: str = "",
+) -> str:
+    """Create a cost guardrail to enforce spending limits for LLM calls.
+
+    Guardrails are checked before each LLM call (via check_cost_guardrail).
+    Unlike spending rules (which check expenses after-the-fact), guardrails
+    are pre-flight checks that can BLOCK calls before they happen.
+
+    Args:
+        name: Guardrail name (e.g., 'Daily LLM cap')
+        scope: Scope — 'global', 'agent', 'model', 'budget', or 'task'
+        scope_id: ID for scoped guardrails (agent_id, model_id, budget_id, task_id)
+        daily_limit_usd: Max daily spend in USD
+        hourly_limit_usd: Max hourly spend in USD
+        per_call_limit_usd: Max cost per single LLM call
+        monthly_limit_usd: Max monthly spend
+        warn_at_percent: Percent of limit to start warning (default 80)
+        block_at_percent: Percent of limit to block at (default 100)
+        cooldown_minutes: If breached, block calls for N minutes
+        priority: Higher priority checked first (default 0)
+        description: Optional description
+    """
+    svc = get_service()
+    try:
+        guardrail = svc.create_guardrail(
+            name=name,
+            scope=GuardrailScope(scope),
+            scope_id=scope_id,
+            daily_limit_usd=daily_limit_usd,
+            hourly_limit_usd=hourly_limit_usd,
+            per_call_limit_usd=per_call_limit_usd,
+            monthly_limit_usd=monthly_limit_usd,
+            warn_at_percent=warn_at_percent,
+            block_at_percent=block_at_percent,
+            cooldown_minutes=cooldown_minutes,
+            priority=priority,
+            description=description,
+        )
+        return json.dumps(guardrail.model_dump(), default=str, indent=2)
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def list_cost_guardrails(enabled_only: bool = True) -> str:
+    """List all cost guardrails, sorted by priority.
+
+    Args:
+        enabled_only: Only show enabled guardrails (default true)
+    """
+    svc = get_service()
+    guardrails = svc.list_guardrails(enabled_only=enabled_only)
+    return json.dumps([g.model_dump() for g in guardrails], default=str, indent=2)
+
+
+@mcp.tool()
+def delete_cost_guardrail(guardrail_id: str) -> str:
+    """Delete a cost guardrail by ID.
+
+    Args:
+        guardrail_id: The guardrail ID (starts with 'GDR-')
+    """
+    svc = get_service()
+    deleted = svc.delete_guardrail(guardrail_id)
+    return json.dumps({"deleted": deleted, "guardrail_id": guardrail_id})
+
+
+@mcp.tool()
+def trigger_kill_switch(
+    reason: str,
+    triggered_by: str | None = None,
+    expires_in_minutes: int | None = None,
+    override_token: str | None = None,
+) -> str:
+    """Trigger the emergency kill switch — blocks ALL LLM calls immediately.
+
+    This is the nuclear option. When active, check_cost_guardrail will return
+    action='kill' for every call, preventing any LLM spending.
+
+    Args:
+        reason: Why the kill switch is being triggered
+        triggered_by: Who or what triggered it
+        expires_in_minutes: Auto-reset after N minutes (None = manual reset only)
+        override_token: Token required to reset (for safety, prevents accidental reset)
+    """
+    svc = get_service()
+    ks = svc.trigger_kill_switch(
+        reason=reason,
+        triggered_by=triggered_by,
+        expires_in_minutes=expires_in_minutes,
+        override_token=override_token,
+    )
+    return json.dumps(ks.model_dump(), default=str, indent=2)
+
+
+@mcp.tool()
+def reset_kill_switch(override_token: str | None = None) -> str:
+    """Reset the kill switch, allowing LLM calls again.
+
+    Args:
+        override_token: Required if the kill switch was set with a token
+    """
+    svc = get_service()
+    try:
+        ks = svc.reset_kill_switch(override_token=override_token)
+        return json.dumps(ks.model_dump(), default=str, indent=2)
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def get_kill_switch_status() -> str:
+    """Check if the kill switch is currently active."""
+    svc = get_service()
+    ks = svc.get_kill_switch_status()
+    return json.dumps(ks.model_dump(), default=str, indent=2)
+
+
+@mcp.tool()
+def list_cost_alerts(
+    guardrail_id: str | None = None,
+    unacknowledged_only: bool = False,
+    limit: int = 50,
+) -> str:
+    """List cost alert events triggered by guardrails.
+
+    Args:
+        guardrail_id: Filter by guardrail ID
+        unacknowledged_only: Only show alerts that haven't been acknowledged
+        limit: Max results (default 50)
+    """
+    svc = get_service()
+    alerts = svc.list_cost_alerts(
+        guardrail_id=guardrail_id,
+        unacknowledged_only=unacknowledged_only,
+        limit=limit,
+    )
+    return json.dumps([a.model_dump() for a in alerts], default=str, indent=2)
 
 
 def run_server():
