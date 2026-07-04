@@ -1078,6 +1078,66 @@ def create_app() -> FastAPI:
         count = svc.clear_cost_alerts(guardrail_id=guardrail_id)
         return {"cleared": count}
 
+    # --- v0.6.0: Spend Projection & Loop Detection ---
+
+    @app.get("/projection")
+    def get_projection(
+        scope: str = "global",
+        scope_id: Optional[str] = None,
+        period: str = "daily",
+    ):
+        """Get spend projection / burn forecast."""
+        from .models import GuardrailScope
+        svc = get_service()
+        projection = svc.project_spend(
+            scope=GuardrailScope(scope),
+            scope_id=scope_id,
+            period=period,
+        )
+        return projection.model_dump(mode="json")
+
+    @app.get("/loop-detection/check")
+    def check_loop(
+        agent_id: Optional[str] = None,
+        model_id: Optional[str] = None,
+    ):
+        """Check if an agent is in a runaway loop."""
+        svc = get_service()
+        result = svc.check_loop(agent_id=agent_id, model_id=model_id)
+        return result.model_dump(mode="json")
+
+    @app.get("/loop-detection/configs")
+    def list_loop_configs(enabled_only: bool = True):
+        """List loop detection configurations."""
+        svc = get_service()
+        configs = svc.list_loop_configs(enabled_only=enabled_only)
+        return [c.model_dump(mode="json") for c in configs]
+
+    @app.post("/loop-detection/configs")
+    def create_loop_config(body: dict):
+        """Create a loop detection configuration."""
+        svc = get_service()
+        config = svc.create_loop_config(
+            name=body.get("name", "Loop Guard"),
+            window_minutes=body.get("window_minutes", 10),
+            repeat_threshold=body.get("repeat_threshold", 5),
+            similarity_threshold=body.get("similarity_threshold", 0.9),
+            agent_id=body.get("agent_id"),
+            model_id=body.get("model_id"),
+            auto_block_minutes=body.get("auto_block_minutes", 0),
+            min_cost_usd=body.get("min_cost_usd", 0.0),
+        )
+        return config.model_dump(mode="json")
+
+    @app.delete("/loop-detection/configs/{config_id}")
+    def delete_loop_config(config_id: str):
+        """Delete a loop detection configuration."""
+        svc = get_service()
+        deleted = svc.delete_loop_config(config_id)
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Config not found")
+        return {"deleted": True, "config_id": config_id}
+
     return app
 
 

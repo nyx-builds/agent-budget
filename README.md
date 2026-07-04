@@ -1,8 +1,18 @@
 # Agent Budget
 
-MCP server + CLI for autonomous agents to manage budgets, track expenses, control spending, set savings goals, enforce spending rules, and **enforce real-time cost guardrails with kill switch** to prevent runaway LLM costs.
+MCP server + CLI for autonomous agents to manage budgets, track expenses, control spending, set savings goals, enforce spending rules, **enforce real-time cost guardrails with kill switch**, **predict spend breaches with burn forecasting**, and **detect runaway loops** to prevent runaway LLM costs.
 
 ## Features
+
+### v0.6.0 — Spend Projection & Loop Detection 🔮
+- **Burn Forecast** — `project_spend()` predicts when limits will be hit based on spend velocity; returns ETA-to-limit, projected spend, and recommendations
+- **Multi-period Projections** — Daily, hourly, and monthly spend projections with confidence scoring
+- **Guardrail Breach Prediction** — Know if a guardrail will trigger *before* period ends, with time-to-limit estimates
+- **Loop Detection** — Detect runaway agents making repeated identical/similar LLM calls
+- **Call Pattern Analysis** — Jaccard similarity on call signatures (model + token buckets) groups repeated operations
+- **Auto-Block** — Automatically block looping agents for N minutes when detected
+- **Configurable Detection Windows** — Set time window, repeat threshold, similarity threshold, and minimum cost
+- **Agent/Model Scoping** — Apply loop detection globally or to specific agents/models
 
 ### v0.5.0 — Cost Guardrails & Kill Switch 🚨
 - **Real-time Pre-flight Checks** — `check_guardrails()` before LLM calls: allow / warn / block decisions
@@ -187,6 +197,13 @@ mcp.run()
 - `get_kill_switch_status` — Check if kill switch is active
 - `list_cost_alerts` — List cost alert events from guardrails
 
+### Spend Projection & Loop Detection Tools (v0.6.0)
+- `project_spend` — **Burn forecast** — projects spend and predicts ETA-to-limit for any scope/period
+- `check_loop` — **Loop detection** — checks if an agent is making repeated similar calls
+- `create_loop_config` — Configure loop detection (window, threshold, similarity, auto-block)
+- `list_loop_configs` — List loop detection configurations
+- `delete_loop_config` — Delete a loop detection configuration
+
 ## Cost Guardrails & Kill Switch (v0.5.0)
 
 Cost guardrails are the key safety feature for autonomous agents. Unlike spending rules (which check after an expense is added), guardrails are checked **before** an LLM call is made.
@@ -273,6 +290,78 @@ svc.trigger_kill_switch(reason="Security incident", override_token="admin-only")
 
 # Reset when safe
 svc.reset_kill_switch(override_token="admin-only")
+```
+
+## Spend Projection & Loop Detection (v0.6.0)
+
+### Burn Forecast
+
+Predicts when you'll hit guardrail limits based on current spend velocity. Agents
+can use this to proactively slow down *before* a guardrail hard-blocks them.
+
+```bash
+# Check daily burn forecast (global scope)
+agent-budget projection check
+
+# Check for a specific agent
+agent-budget projection check --scope agent --scope-id worker-bot --period hourly
+
+# Monthly projection
+agent-budget projection check --period monthly
+```
+
+```python
+from agent_budget.service import BudgetService
+from agent_budget.models import GuardrailScope
+
+svc = BudgetService()
+
+# Get burn forecast before it's too late
+proj = svc.project_spend(scope=GuardrailScope.AGENT, scope_id="worker-bot", period="daily")
+print(f"Current: ${proj.current_spend_usd:.2f}")
+print(f"Projected: ${proj.projected_spend_usd:.2f}")
+if proj.will_breach_guardrail:
+    print(f"⚠️ Will breach! ETA: {proj.eta_minutes_to_limit:.0f} min")
+    print(f"Recommendation: {proj.recommendation}")
+```
+
+### Loop Detection
+
+Detects runaway agents making repeated identical/similar LLM calls — the most
+common way agents burn budget in infinite retry loops.
+
+```bash
+# Create a loop detection config
+agent-budget loop create --name "Global Loop Guard" --window 10 --threshold 5
+
+# With auto-block (blocks agent for 30 min when detected)
+agent-budget loop create --name "Aggressive Guard" --threshold 3 --auto-block 30
+
+# Check for loops
+agent-budget loop check --agent-id worker-bot
+
+# List configs
+agent-budget loop list
+```
+
+```python
+svc = BudgetService()
+
+# Configure loop detection
+svc.create_loop_config(
+    name="Global Loop Guard",
+    window_minutes=10,
+    repeat_threshold=5,
+    similarity_threshold=0.9,
+    auto_block_minutes=30,
+)
+
+# Check if an agent is looping
+result = svc.check_loop(agent_id="worker-bot")
+if result.detected:
+    print(f"LOOP DETECTED: {result.call_count} similar calls")
+    print(f"Cost burned: ${result.cumulative_cost_usd:.4f}")
+    print(f"Recommendation: {result.recommendation}")
 ```
 
 ## Python API

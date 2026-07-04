@@ -4,13 +4,13 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agent-budget"
-version = "0.5.0"
-description = "MCP server + CLI for autonomous agents to manage budgets, track income/expenses, cash flow, burn rate, savings goals, spending rules, and real-time cost guardrails with kill switch"
+version = "0.6.0"
+description = "MCP server + CLI for autonomous agents to manage budgets, track income/expenses, cash flow, burn rate, savings goals, spending rules, real-time cost guardrails with kill switch, spend projections, and loop detection"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
 authors = [{ name = "Nyx Builds", email = "nyx-builds@users.noreply.github.com" }]
-keywords = ["budget", "expenses", "mcp", "agent", "spending", "forecasting", "cost-control", "kill-switch", "guardrails"]
+keywords = ["budget", "expenses", "mcp", "agent", "spending", "forecasting", "cost-control", "kill-switch", "guardrails", "loop-detection", "burn-rate"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",

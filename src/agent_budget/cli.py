@@ -1772,5 +1772,156 @@ def cost_alerts_clear(guardrail):
     console.print(f"[bold green]✓ Cleared {count} alert(s)[/bold green]")
 
 
+# --- v0.6.0 Spend Projection CLI ---
+
+@main.group("projection")
+def projection_group():
+    """Spend projections and burn forecasting."""
+
+
+@projection_group.command("check")
+@click.option("--scope", default="global", type=click.Choice(["global", "agent", "model", "budget", "task"]))
+@click.option("--scope-id", default=None, help="Entity ID for scoped projections")
+@click.option("--period", default="daily", type=click.Choice(["daily", "hourly", "monthly"]))
+def projection_check(scope, scope_id, period):
+    """Check spend projection and ETA to limit."""
+    svc = get_service()
+    from agent_budget.models import GuardrailScope
+    proj = svc.project_spend(scope=GuardrailScope(scope), scope_id=scope_id, period=period)
+
+    console.print(f"\n[bold cyan]📊 Spend Projection ({proj.period})[/bold cyan]")
+    console.print(f"  Scope: [yellow]{proj.scope.value}[/yellow]" + (f" ({proj.scope_id})" if proj.scope_id else ""))
+    console.print(f"  Current spend: [white]${proj.current_spend_usd:.4f}[/white]")
+    console.print(f"  Projected: [{'red' if proj.projected_exceeds_limit else 'green'}]${proj.projected_spend_usd:.4f}[/]")
+    console.print(f"  Spend rate: [white]${proj.spend_rate_per_hour:.4f}/hr[/white]")
+    console.print(f"  Calls in period: [white]{proj.call_count_in_period}[/white]")
+    console.print(f"  Avg cost/call: [white]${proj.avg_cost_per_call:.4f}[/white]")
+
+    if proj.limit_usd:
+        console.print(f"  Limit: [yellow]${proj.limit_usd:.2f}[/yellow]")
+        pct = (proj.projected_spend_usd / proj.limit_usd * 100) if proj.limit_usd > 0 else 0
+        console.print(f"  Projected %: [{'red' if pct > 80 else 'yellow' if pct > 50 else 'green'}]{pct:.1f}%[/]")
+        if proj.eta_minutes_to_limit is not None:
+            if proj.eta_minutes_to_limit == 0:
+                console.print(f"  ETA to limit: [bold red]ALREADY OVER LIMIT[/bold red]")
+            elif proj.eta_minutes_to_limit < 60:
+                console.print(f"  ETA to limit: [bold red]{proj.eta_minutes_to_limit:.0f} minutes[/bold red]")
+            else:
+                console.print(f"  ETA to limit: [yellow]{proj.eta_minutes_to_limit/60:.1f} hours[/yellow]")
+    else:
+        console.print(f"  Limit: [dim]No guardrail configured[/dim]")
+
+    if proj.will_breach_guardrail:
+        console.print(f"\n  [bold red]⚠️ Will breach guardrail before period ends![/bold red]")
+    console.print(f"  Confidence: [dim]{proj.confidence*100:.0f}%[/dim]")
+    console.print(f"\n  [italic]{proj.recommendation}[/italic]\n")
+
+
+# --- v0.6.0 Loop Detection CLI ---
+
+@main.group("loop")
+def loop_group():
+    """Loop detection for runaway agents."""
+
+
+@loop_group.command("check")
+@click.option("--agent-id", default=None, help="Agent to check (None = all)")
+@click.option("--model-id", default=None, help="Filter by model")
+def loop_check(agent_id, model_id):
+    """Check if an agent is in a runaway loop."""
+    svc = get_service()
+    result = svc.check_loop(agent_id=agent_id, model_id=model_id)
+
+    if result.detected:
+        console.print(f"\n[bold red]🔴 LOOP DETECTED[/bold red]")
+        console.print(f"  Agent: [yellow]{result.agent_id or 'all'}[/yellow]")
+        console.print(f"  Model: [white]{result.model_id}[/white]")
+        console.print(f"  Calls: [bold]{result.call_count}[/bold] similar calls in {result.window_minutes} min")
+        console.print(f"  Cumulative cost: [red]${result.cumulative_cost_usd:.4f}[/red]")
+        console.print(f"  Avg similarity: [white]{result.avg_similarity:.2%}[/white]")
+        console.print(f"  Signature: [dim]{result.sample_signature}[/dim]")
+        if result.blocked_until:
+            console.print(f"  [bold red]BLOCKED until {result.blocked_until.strftime('%H:%M:%S')}[/bold red]")
+        console.print(f"\n  [italic]{result.recommendation}[/italic]\n")
+        sys.exit(1)
+    else:
+        console.print(f"[bold green]✓ No loops detected[/bold green]")
+        console.print(f"  [dim]{result.recommendation}[/dim]")
+
+
+@loop_group.command("create")
+@click.option("--name", required=True, help="Config name")
+@click.option("--window", default=10, help="Detection window in minutes")
+@click.option("--threshold", default=5, help="Repeat threshold (number of similar calls)")
+@click.option("--similarity", default=0.9, help="Similarity threshold (0-1)")
+@click.option("--agent-id", default=None, help="Only apply to this agent")
+@click.option("--model-id", default=None, help="Only apply to this model")
+@click.option("--auto-block", default=0, help="Auto-block for N minutes (0 = alert only)")
+@click.option("--min-cost", default=0.0, help="Minimum cumulative cost to flag")
+def loop_create(name, window, threshold, similarity, agent_id, model_id, auto_block, min_cost):
+    """Create a loop detection configuration."""
+    svc = get_service()
+    config = svc.create_loop_config(
+        name=name,
+        window_minutes=window,
+        repeat_threshold=threshold,
+        similarity_threshold=similarity,
+        agent_id=agent_id,
+        model_id=model_id,
+        auto_block_minutes=auto_block,
+        min_cost_usd=min_cost,
+    )
+    console.print(f"[bold green]✓ Created loop detection config:[/bold green] {config.id}")
+    console.print(f"  Name: {config.name}")
+    console.print(f"  Window: {config.window_minutes} min, Threshold: {config.repeat_threshold} calls")
+    console.print(f"  Similarity: {config.similarity_threshold}, Auto-block: {config.auto_block_minutes} min")
+
+
+@loop_group.command("list")
+@click.option("--all", "show_all", is_flag=True, help="Show disabled configs too")
+def loop_list(show_all):
+    """List loop detection configurations."""
+    svc = get_service()
+    configs = svc.list_loop_configs(enabled_only=not show_all)
+    if not configs:
+        console.print("[dim]No loop detection configs. Create one with 'loop create'.[/dim]")
+        return
+    table = Table(title="Loop Detection Configs")
+    table.add_column("ID", style="cyan")
+    table.add_column("Name", style="white")
+    table.add_column("Window", justify="right")
+    table.add_column("Threshold", justify="right")
+    table.add_column("Similarity", justify="right")
+    table.add_column("Agent")
+    table.add_column("Block", justify="right")
+    table.add_column("Status")
+
+    for c in configs:
+        status = "[green]enabled[/green]" if c.enabled else "[red]disabled[/red]"
+        table.add_row(
+            c.id,
+            c.name,
+            f"{c.window_minutes}m",
+            str(c.repeat_threshold),
+            f"{c.similarity_threshold:.1f}",
+            c.agent_id or "*",
+            f"{c.auto_block_minutes}m" if c.auto_block_minutes > 0 else "-",
+            status,
+        )
+    console.print(table)
+
+
+@loop_group.command("delete")
+@click.argument("config_id")
+def loop_delete(config_id):
+    """Delete a loop detection configuration."""
+    svc = get_service()
+    if svc.delete_loop_config(config_id):
+        console.print(f"[bold green]✓ Deleted:[/bold green] {config_id}")
+    else:
+        console.print(f"[bold red]Not found:[/bold red] {config_id}")
+        sys.exit(1)
+
+
 if __name__ == "__main__":
     main()

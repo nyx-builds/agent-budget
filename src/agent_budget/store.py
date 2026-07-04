@@ -13,6 +13,7 @@ from .models import (
     SavingsGoal, SavingsContribution, SpendingRule, BudgetRollover,
     Income, RecurringIncome, IncomeStatus,
     CostGuardrail, KillSwitch, CostAlertEvent,
+    LoopDetectionConfig,
 )
 from .llm_costs import LLMUsageRecord, ModelPrice, ModelProvider
 
@@ -38,6 +39,7 @@ class BudgetStore:
         self._guardrails_file = self.data_dir / "guardrails.json"
         self._killswitch_file = self.data_dir / "killswitch.json"
         self._cost_alerts_file = self.data_dir / "cost_alerts.json"
+        self._loop_configs_file = self.data_dir / "loop_configs.json"
 
     # --- JSON helpers ---
 
@@ -625,3 +627,39 @@ class BudgetStore:
         cleared = len(alerts) - len(new_alerts)
         self._write_json(self._cost_alerts_file, [a.model_dump() for a in new_alerts])
         return cleared
+
+    # --- Loop Detection Configs (v0.6.0) ---
+
+    def list_loop_configs(self, enabled_only: bool = False) -> list[LoopDetectionConfig]:
+        data = self._read_json(self._loop_configs_file)
+        configs = [LoopDetectionConfig(**d) for d in data]
+        if enabled_only:
+            configs = [c for c in configs if c.enabled]
+        return configs
+
+    def get_loop_config(self, config_id: str) -> Optional[LoopDetectionConfig]:
+        for c in self.list_loop_configs():
+            if c.id == config_id:
+                return c
+        return None
+
+    def save_loop_config(self, config: LoopDetectionConfig) -> LoopDetectionConfig:
+        configs = self.list_loop_configs()
+        found = False
+        for idx, c in enumerate(configs):
+            if c.id == config.id:
+                configs[idx] = config
+                found = True
+                break
+        if not found:
+            configs.append(config)
+        self._write_json(self._loop_configs_file, [c.model_dump() for c in configs])
+        return config
+
+    def delete_loop_config(self, config_id: str) -> bool:
+        configs = self.list_loop_configs()
+        new_configs = [c for c in configs if c.id != config_id]
+        if len(new_configs) == len(configs):
+            return False
+        self._write_json(self._loop_configs_file, [c.model_dump() for c in new_configs])
+        return True

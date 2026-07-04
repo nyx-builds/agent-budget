@@ -486,6 +486,80 @@ class CostAlertEvent(BaseModel):
     acknowledged: bool = Field(default=False)
 
 
+# --- v0.6.0 Spend Projection & Loop Detection Models ---
+
+
+class SpendProjection(BaseModel):
+    """Projected spend and ETA-to-limit for a guardrail scope.
+
+    Predicts when limits will be hit based on recent spend velocity.
+    This is the 'burn forecast' — agents can use it to decide whether
+    to switch models, reduce context, or proactively throttle before
+    a guardrail hard-blocks them.
+    """
+    scope: GuardrailScope = Field(description="Guardrail scope")
+    scope_id: Optional[str] = Field(default=None, description="Scope entity ID")
+    period: str = Field(description="Period being projected: daily, hourly, monthly")
+    current_spend_usd: float = Field(default=0.0, ge=0, description="Spend so far this period")
+    projected_spend_usd: float = Field(default=0.0, ge=0, description="Projected total spend by period end")
+    spend_rate_per_hour: float = Field(default=0.0, description="Current spend rate USD/hour")
+    limit_usd: Optional[float] = Field(default=None, description="The limit for this period (if a guardrail applies)")
+    projected_exceeds_limit: bool = Field(default=False, description="Whether projected spend will exceed the limit")
+    eta_minutes_to_limit: Optional[float] = Field(default=None, description="Minutes until limit is hit at current rate (None if no limit or already over)")
+    will_breach_guardrail: bool = Field(default=False, description="Whether a guardrail will trigger before period end")
+    guardrail_id: Optional[str] = Field(default=None, description="Guardrail that will be breached")
+    call_count_in_period: int = Field(default=0, description="Number of LLM calls so far this period")
+    avg_cost_per_call: float = Field(default=0.0, description="Average cost per call this period")
+    confidence: float = Field(default=0.0, ge=0, le=1, description="Confidence in projection (based on data points)")
+    recommendation: str = Field(default="", description="Human-readable recommendation")
+    projected_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class LoopDetectionConfig(BaseModel):
+    """Configuration for detecting runaway agent loops.
+
+    Loop detection identifies when an agent is making repeated identical
+    or near-identical LLM calls — a common failure mode where an agent
+    burns budget in an infinite retry loop. Unlike guardrails (which
+    check spend amounts), loop detection checks *call patterns*.
+    """
+    id: str = Field(default_factory=lambda: f"LDC-{uuid.uuid4().hex[:8].upper()}")
+    name: str = Field(min_length=1, description="Config name (e.g., 'Global loop guard')")
+    enabled: bool = Field(default=True)
+    # Detection window: how far back to look for repeated calls
+    window_minutes: int = Field(default=10, ge=1, description="Time window to detect loops in")
+    # Threshold: number of identical/similar calls in window to flag a loop
+    repeat_threshold: int = Field(default=5, ge=2, description="Number of similar calls to flag a loop")
+    # Similarity: how similar calls must be to count as 'the same'
+    # 1.0 = exact match, 0.9 = very similar, 0.7 = loosely similar
+    similarity_threshold: float = Field(default=0.9, ge=0.0, le=1.0, description="Jaccard similarity threshold for 'similar' calls")
+    # Scope: apply to all agents or specific ones
+    agent_id: Optional[str] = Field(default=None, description="Only apply to this agent (None = all)")
+    model_id: Optional[str] = Field(default=None, description="Only apply to this model (None = all)")
+    # Auto-action when loop detected
+    auto_block_minutes: int = Field(default=0, ge=0, description="Auto-block agent for N minutes when loop detected (0 = just alert)")
+    # Cost threshold: only flag loops where cumulative cost exceeds this
+    min_cost_usd: float = Field(default=0.0, ge=0, description="Minimum cumulative cost in window to flag (0 = always flag)")
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class LoopDetectionResult(BaseModel):
+    """Result of a loop detection check."""
+    detected: bool = Field(description="Whether a loop was detected")
+    config_id: Optional[str] = Field(default=None, description="Config that triggered")
+    agent_id: Optional[str] = Field(default=None)
+    model_id: Optional[str] = Field(default=None)
+    call_count: int = Field(default=0, description="Number of similar calls in window")
+    window_minutes: int = Field(default=0, description="Detection window used")
+    cumulative_cost_usd: float = Field(default=0.0, description="Total cost of the repeated calls")
+    avg_similarity: float = Field(default=0.0, description="Average similarity between calls")
+    sample_signature: Optional[str] = Field(default=None, description="A sample of the repeated call signature")
+    recommendation: str = Field(default="", description="Human-readable recommendation")
+    blocked_until: Optional[datetime] = Field(default=None, description="If auto-blocked, when the block expires")
+    detected_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
 class CurrencyInfo(BaseModel):
     """Currency metadata."""
     code: str

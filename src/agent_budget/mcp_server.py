@@ -1488,6 +1488,115 @@ def list_cost_alerts(
     return json.dumps([a.model_dump() for a in alerts], default=str, indent=2)
 
 
+# --- v0.6.0 Spend Projection & Loop Detection Tools ---
+
+@mcp.tool()
+def project_spend(
+    scope: str = "global",
+    scope_id: str | None = None,
+    period: str = "daily",
+) -> str:
+    """Project spend and predict when limits will be hit (burn forecast).
+
+    Analyzes recent LLM usage to predict whether you'll breach guardrail
+    limits before the period ends. Use this to proactively slow down
+    BEFORE a guardrail hard-blocks your calls.
+
+    Args:
+        scope: global, agent, model, budget, or task
+        scope_id: Entity ID for scoped projections (e.g., agent_id)
+        period: daily, hourly, or monthly
+    """
+    svc = get_service()
+    from .models import GuardrailScope
+    projection = svc.project_spend(
+        scope=GuardrailScope(scope),
+        scope_id=scope_id,
+        period=period,
+    )
+    return json.dumps(projection.model_dump(), default=str, indent=2)
+
+
+@mcp.tool()
+def check_loop(
+    agent_id: str | None = None,
+    model_id: str | None = None,
+) -> str:
+    """Check if an agent is in a runaway loop based on recent call patterns.
+
+    Detects repeated similar LLM calls within a time window — a common
+    failure mode where an agent burns budget retrying the same operation.
+
+    Args:
+        agent_id: Agent to check (None = all agents)
+        model_id: Filter to specific model
+    """
+    svc = get_service()
+    result = svc.check_loop(agent_id=agent_id, model_id=model_id)
+    return json.dumps(result.model_dump(), default=str, indent=2)
+
+
+@mcp.tool()
+def create_loop_config(
+    name: str,
+    window_minutes: int = 10,
+    repeat_threshold: int = 5,
+    similarity_threshold: float = 0.9,
+    agent_id: str | None = None,
+    model_id: str | None = None,
+    auto_block_minutes: int = 0,
+    min_cost_usd: float = 0.0,
+) -> str:
+    """Create a loop detection configuration.
+
+    Args:
+        name: Config name (e.g., 'Global loop guard')
+        window_minutes: Detection window in minutes (default 10)
+        repeat_threshold: Number of similar calls to flag a loop (default 5)
+        similarity_threshold: Jaccard similarity threshold 0-1 (default 0.9)
+        agent_id: Only apply to this agent (None = all)
+        model_id: Only apply to this model (None = all)
+        auto_block_minutes: Auto-block agent for N minutes (0 = just alert)
+        min_cost_usd: Minimum cumulative cost to flag (0 = always flag)
+    """
+    svc = get_service()
+    config = svc.create_loop_config(
+        name=name,
+        window_minutes=window_minutes,
+        repeat_threshold=repeat_threshold,
+        similarity_threshold=similarity_threshold,
+        agent_id=agent_id,
+        model_id=model_id,
+        auto_block_minutes=auto_block_minutes,
+        min_cost_usd=min_cost_usd,
+    )
+    return json.dumps(config.model_dump(), default=str, indent=2)
+
+
+@mcp.tool()
+def list_loop_configs(enabled_only: bool = True) -> str:
+    """List loop detection configurations.
+
+    Args:
+        enabled_only: Only show enabled configs (default True)
+    """
+    svc = get_service()
+    configs = svc.list_loop_configs(enabled_only=enabled_only)
+    return json.dumps([c.model_dump() for c in configs], default=str, indent=2)
+
+
+@mcp.tool()
+def delete_loop_config(config_id: str) -> str:
+    """Delete a loop detection configuration.
+
+    Args:
+        config_id: Config ID to delete
+    """
+    svc = get_service()
+    deleted = svc.delete_loop_config(config_id)
+    return json.dumps({"deleted": deleted, "config_id": config_id}, indent=2)
+
+
 def run_server():
     """Run the MCP server."""
     mcp.run()

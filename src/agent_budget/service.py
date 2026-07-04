@@ -17,6 +17,7 @@ from .models import (
     CashFlowSummary, BurnRate, FinancialDashboard,
     CostGuardrail, GuardrailScope, GuardrailAction, GuardrailDecision,
     KillSwitch, CostAlertEvent,
+    SpendProjection, LoopDetectionConfig, LoopDetectionResult,
 )
 from .store import BudgetStore
 
@@ -2326,3 +2327,385 @@ class BudgetService:
     def clear_cost_alerts(self, guardrail_id: Optional[str] = None) -> int:
         """Clear cost alerts, optionally filtered by guardrail."""
         return self.store.clear_cost_alerts(guardrail_id=guardrail_id)
+
+    # --- v0.6.0: Spend Projection ---
+
+    def project_spend(
+        self,
+        scope: GuardrailScope = GuardrailScope.GLOBAL,
+        scope_id: Optional[str] = None,
+        period: str = "daily",
+        now: Optional[datetime] = None,
+    ) -> SpendProjection:
+        """Project spend for a scope/period and predict if limits will be hit.
+
+        This is the 'burn forecast' — analyzes recent LLM usage to extrapolate
+        when guardrail limits will be breached. Agents use this to proactively
+        slow down BEFORE a guardrail hard-blocks them.
+
+        Args:
+            scope: Guardrail scope to project
+            scope_id: Entity ID for scoped projections
+            period: 'daily', 'hourly', or 'monthly'
+            now: Override current time (for testing)
+
+        Returns:
+            SpendProjection with projected spend, ETA, and recommendations
+        """
+        now = now or datetime.now(timezone.utc)
+
+        # Determine period boundaries
+        if period == "hourly":
+            period_start = now - timedelta(hours=1)
+            period_label = "hourly"
+        elif period == "monthly":
+            period_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            period_label = "monthly"
+        else:  # daily (default)
+            period_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            period_label = "daily"
+
+        # Get spend data for this period
+        records = self.store.list_llm_usage(from_date=period_start.date())
+        period_records = []
+        for r in records:
+            if r.recorded_at < period_start or r.recorded_at > now:
+                continue
+            if scope == GuardrailScope.GLOBAL:
+                period_records.append(r)
+            elif scope == GuardrailScope.AGENT and scope_id:
+                if r.agent_id and r.agent_id.lower() == scope_id.lower():
+                    period_records.append(r)
+            elif scope == GuardrailScope.MODEL and scope_id:
+                if r.model_id.lower() == scope_id.lower():
+                    period_records.append(r)
+            elif scope == GuardrailScope.TASK and scope_id:
+                if r.task_id and r.task_id.lower() == scope_id.lower():
+                    period_records.append(r)
+            elif scope == GuardrailScope.BUDGET and scope_id:
+                if r.metadata.get("budget_id", "").lower() == scope_id.lower():
+                    period_records.append(r)
+
+        current_spend = sum(r.cost_usd for r in period_records)
+        call_count = len(period_records)
+        avg_cost_per_call = current_spend / call_count if call_count > 0 else 0.0
+
+        # Calculate spend rate (USD/hour) based on elapsed time
+        elapsed_minutes = (now - period_start).total_seconds() / 60.0
+        elapsed_hours = max(elapsed_minutes / 60.0, 0.01)  # avoid div by zero
+        spend_rate = current_spend / elapsed_hours if elapsed_hours > 0 else 0.0
+
+        # Determine remaining time in period
+        if period == "hourly":
+            remaining_hours = max(((period_start + timedelta(hours=1)) - now).total_seconds() / 3600.0, 0.0)
+            period_total_hours = 1.0
+        elif period == "monthly":
+            # Days in current month
+            if now.month == 12:
+                next_month = now.replace(year=now.year + 1, month=1, day=1)
+            else:
+                next_month = now.replace(month=now.month + 1, day=1)
+            remaining_hours = max((next_month - now).total_seconds() / 3600.0, 0.0)
+            period_total_hours = ((next_month - period_start).total_seconds() / 3600.0)
+        else:  # daily
+            end_of_day = now.replace(hour=23, minute=59, second=59)
+            remaining_hours = max((end_of_day - now).total_seconds() / 3600.0, 0.0)
+            period_total_hours = 24.0
+
+        # Project: current spend + rate * remaining hours
+        projected_spend = current_spend + (spend_rate * remaining_hours)
+
+        # Find applicable guardrail for this scope
+        applicable_limit = None
+        applicable_guardrail = None
+        for g in self.store.list_guardrails(enabled_only=True):
+            if g.scope != scope:
+                continue
+            if scope != GuardrailScope.GLOBAL and scope_id and g.scope_id:
+                if g.scope_id.lower() != scope_id.lower():
+                    continue
+            if period == "daily" and g.daily_limit_usd is not None:
+                applicable_limit = g.daily_limit_usd
+                applicable_guardrail = g
+                break
+            elif period == "hourly" and g.hourly_limit_usd is not None:
+                applicable_limit = g.hourly_limit_usd
+                applicable_guardrail = g
+                break
+            elif period == "monthly" and g.monthly_limit_usd is not None:
+                applicable_limit = g.monthly_limit_usd
+                applicable_guardrail = g
+                break
+
+        # Compute ETA to limit
+        eta_minutes = None
+        projected_exceeds = False
+        will_breach = False
+        if applicable_limit and spend_rate > 0:
+            remaining_budget = applicable_limit - current_spend
+            if remaining_budget > 0:
+                eta_hours = remaining_budget / spend_rate
+                eta_minutes = eta_hours * 60.0
+            else:
+                eta_minutes = 0.0  # already over
+                projected_exceeds = True
+            if projected_spend > applicable_limit:
+                projected_exceeds = True
+            # Check if guardrail will trigger (at warn/block percent)
+            if applicable_guardrail:
+                warn_threshold = applicable_limit * (applicable_guardrail.warn_at_percent / 100.0)
+                block_threshold = applicable_limit * (applicable_guardrail.block_at_percent / 100.0)
+                if projected_spend >= block_threshold or projected_spend >= warn_threshold:
+                    will_breach = True
+
+        # Confidence: more data points = higher confidence
+        if call_count >= 20:
+            confidence = 0.9
+        elif call_count >= 10:
+            confidence = 0.75
+        elif call_count >= 5:
+            confidence = 0.6
+        elif call_count >= 2:
+            confidence = 0.4
+        elif call_count >= 1:
+            confidence = 0.2
+        else:
+            confidence = 0.0
+
+        # Build recommendation
+        recommendation = self._build_projection_recommendation(
+            projected_spend, applicable_limit, eta_minutes, will_breach, spend_rate
+        )
+
+        return SpendProjection(
+            scope=scope,
+            scope_id=scope_id,
+            period=period_label,
+            current_spend_usd=round(current_spend, 6),
+            projected_spend_usd=round(projected_spend, 6),
+            spend_rate_per_hour=round(spend_rate, 6),
+            limit_usd=applicable_limit,
+            projected_exceeds_limit=projected_exceeds,
+            eta_minutes_to_limit=round(eta_minutes, 1) if eta_minutes is not None else None,
+            will_breach_guardrail=will_breach,
+            guardrail_id=applicable_guardrail.id if applicable_guardrail else None,
+            call_count_in_period=call_count,
+            avg_cost_per_call=round(avg_cost_per_call, 6),
+            confidence=confidence,
+            recommendation=recommendation,
+        )
+
+    def _build_projection_recommendation(
+        self,
+        projected: float,
+        limit: Optional[float],
+        eta_minutes: Optional[float],
+        will_breach: bool,
+        rate: float,
+    ) -> str:
+        """Build a human-readable recommendation from a projection."""
+        if not limit:
+            if rate > 0:
+                return f"Spending at ${rate:.2f}/hour. No guardrail limit set for this scope — consider adding one."
+            return "No spending detected in this period."
+
+        if will_breach:
+            if eta_minutes is not None and eta_minutes > 0:
+                if eta_minutes < 60:
+                    return f"⚠️ At current rate (${rate:.2f}/hr), you'll hit the ${limit:.2f} limit in {eta_minutes:.0f} minutes. Reduce call frequency or switch to a cheaper model now."
+                else:
+                    return f"⚠️ At current rate (${rate:.2f}/hr), you'll hit the ${limit:.2f} limit in {eta_minutes/60:.1f} hours. Consider throttling."
+            return f"⚠️ Projected spend ${projected:.2f} will exceed limit ${limit:.2f}. Take action now."
+
+        if projected > limit * 0.8:
+            return f"Projecting ${projected:.2f} of ${limit:.2f} limit ({projected/limit*100:.0f}%). Approaching limit — monitor closely."
+
+        if projected > limit * 0.5:
+            return f"Projecting ${projected:.2f} of ${limit:.2f} limit ({projected/limit*100:.0f}%). On track but trending up."
+
+        return f"Projecting ${projected:.2f} of ${limit:.2f} limit ({projected/limit*100:.0f}%). Well within budget."
+
+    # --- v0.6.0: Loop Detection ---
+
+    @staticmethod
+    def _call_signature(record) -> str:
+        """Create a signature for an LLM call for similarity comparison.
+
+        Uses model_id + input_tokens range + output_tokens range as a proxy
+        for call content. Two calls with the same model and similar token
+        counts are likely doing similar work.
+        """
+        model = record.model_id
+        # Bucket tokens to 1000s to group near-identical calls
+        in_bucket = record.input_tokens // 1000
+        out_bucket = record.output_tokens // 1000
+        return f"{model}|in:{in_bucket}k|out:{out_bucket}k"
+
+    @staticmethod
+    def _jaccard_similarity(set_a: set, set_b: set) -> float:
+        """Jaccard similarity between two sets."""
+        if not set_a and not set_b:
+            return 1.0
+        union = set_a | set_b
+        if not union:
+            return 0.0
+        return len(set_a & set_b) / len(union)
+
+    def check_loop(
+        self,
+        agent_id: Optional[str] = None,
+        model_id: Optional[str] = None,
+        now: Optional[datetime] = None,
+    ) -> LoopDetectionResult:
+        """Check if an agent is in a runaway loop based on recent call patterns.
+
+        Scans recent LLM usage records and detects repeated similar calls
+        within the configured detection window. If a loop is detected,
+        returns details including recommended action.
+
+        Args:
+            agent_id: Agent to check (if None, checks all agents)
+            model_id: Filter to specific model
+            now: Override current time (for testing)
+
+        Returns:
+            LoopDetectionResult with detection status and details
+        """
+        now = now or datetime.now(timezone.utc)
+
+        configs = self.store.list_loop_configs(enabled_only=True)
+        if not configs:
+            return LoopDetectionResult(
+                detected=False,
+                recommendation="No loop detection configs enabled. Configure one to detect runaway loops.",
+            )
+
+        # Check each config (most recently created first)
+        for config in configs:
+            # Scope filtering
+            if config.agent_id and agent_id:
+                if config.agent_id.lower() != agent_id.lower():
+                    continue
+            if config.model_id and model_id:
+                if config.model_id.lower() != model_id.lower():
+                    continue
+
+            window_start = now - timedelta(minutes=config.window_minutes)
+            records = self.store.list_llm_usage(from_date=window_start.date())
+
+            # Filter to window and scope
+            window_records = []
+            for r in records:
+                if r.recorded_at < window_start or r.recorded_at > now:
+                    continue
+                if agent_id and r.agent_id and r.agent_id.lower() != agent_id.lower():
+                    continue
+                if model_id and r.model_id.lower() != model_id.lower():
+                    continue
+                window_records.append(r)
+
+            if len(window_records) < config.repeat_threshold:
+                continue
+
+            # Group records by call signature
+            signatures: dict[str, list] = {}
+            for r in window_records:
+                sig = self._call_signature(r)
+                signatures.setdefault(sig, []).append(r)
+
+            # Check if any signature group exceeds threshold
+            for sig, group in signatures.items():
+                if len(group) >= config.repeat_threshold:
+                    cumulative_cost = sum(r.cost_usd for r in group)
+                    # Check min cost threshold
+                    if config.min_cost_usd > 0 and cumulative_cost < config.min_cost_usd:
+                        continue
+
+                    # Compute average pairwise similarity
+                    similarities = []
+                    for i in range(len(group)):
+                        for j in range(i + 1, len(group)):
+                            set_i = {self._call_signature(group[i])}
+                            set_j = {self._call_signature(group[j])}
+                            similarities.append(self._jaccard_similarity(set_i, set_j))
+                    avg_sim = sum(similarities) / len(similarities) if similarities else 1.0
+
+                    if avg_sim >= config.similarity_threshold:
+                        # Auto-block?
+                        blocked_until = None
+                        recommendation_parts = [
+                            f"Loop detected: {len(group)} similar calls ('{sig}') in {config.window_minutes} min window.",
+                            f"Cumulative cost: ${cumulative_cost:.4f}.",
+                            "The agent may be stuck retrying the same operation.",
+                        ]
+                        if config.auto_block_minutes > 0:
+                            blocked_until = now + timedelta(minutes=config.auto_block_minutes)
+                            recommendation_parts.append(
+                                f"Agent auto-blocked for {config.auto_block_minutes} minutes (until {blocked_until.isoformat()})."
+                            )
+                        recommendation_parts.append("Review agent logic — consider adding a retry limit or different error handling.")
+
+                        return LoopDetectionResult(
+                            detected=True,
+                            config_id=config.id,
+                            agent_id=agent_id,
+                            model_id=group[0].model_id,
+                            call_count=len(group),
+                            window_minutes=config.window_minutes,
+                            cumulative_cost_usd=round(cumulative_cost, 6),
+                            avg_similarity=round(avg_sim, 4),
+                            sample_signature=sig,
+                            recommendation=" ".join(recommendation_parts),
+                            blocked_until=blocked_until,
+                        )
+
+        return LoopDetectionResult(
+            detected=False,
+            agent_id=agent_id,
+            recommendation="No loops detected in recent call history.",
+        )
+
+    def create_loop_config(
+        self,
+        name: str,
+        window_minutes: int = 10,
+        repeat_threshold: int = 5,
+        similarity_threshold: float = 0.9,
+        agent_id: Optional[str] = None,
+        model_id: Optional[str] = None,
+        auto_block_minutes: int = 0,
+        min_cost_usd: float = 0.0,
+        enabled: bool = True,
+    ) -> LoopDetectionConfig:
+        """Create a new loop detection configuration."""
+        config = LoopDetectionConfig(
+            name=name,
+            window_minutes=window_minutes,
+            repeat_threshold=repeat_threshold,
+            similarity_threshold=similarity_threshold,
+            agent_id=agent_id,
+            model_id=model_id,
+            auto_block_minutes=auto_block_minutes,
+            min_cost_usd=min_cost_usd,
+            enabled=enabled,
+        )
+        return self.store.save_loop_config(config)
+
+    def update_loop_config(self, config_id: str, **kwargs) -> LoopDetectionConfig:
+        """Update a loop detection config. Pass field names as kwargs."""
+        config = self.store.get_loop_config(config_id)
+        if not config:
+            raise ValueError(f"Loop detection config {config_id} not found")
+        for key, value in kwargs.items():
+            if hasattr(config, key) and value is not None:
+                setattr(config, key, value)
+        config.updated_at = datetime.now(timezone.utc)
+        return self.store.save_loop_config(config)
+
+    def list_loop_configs(self, enabled_only: bool = False) -> list[LoopDetectionConfig]:
+        """List loop detection configurations."""
+        return self.store.list_loop_configs(enabled_only=enabled_only)
+
+    def delete_loop_config(self, config_id: str) -> bool:
+        """Delete a loop detection configuration."""
+        return self.store.delete_loop_config(config_id)
