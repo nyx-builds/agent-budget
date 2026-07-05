@@ -9,6 +9,18 @@ from typing import Optional
 from pydantic import BaseModel, Field, field_validator
 
 
+def _advance_months(d: date, n: int) -> date:
+    """Advance a date by ``n`` months, clamping the day to the end of the
+    target month (e.g. Jan 31 + 1 month → Feb 28)."""
+    import calendar
+
+    idx = d.month - 1 + n
+    year = d.year + idx // 12
+    month = idx % 12 + 1
+    max_day = calendar.monthrange(year, month)[1]
+    return d.replace(year=year, month=month, day=min(d.day, max_day))
+
+
 # --- Enums ---
 
 class BudgetPeriod(str, Enum):
@@ -213,19 +225,9 @@ class RecurringExpense(BaseModel):
         elif self.frequency == RecurringFrequency.BIWEEKLY:
             return d + timedelta(weeks=2)
         elif self.frequency == RecurringFrequency.MONTHLY:
-            month = d.month + 1
-            year = d.year
-            if month > 12:
-                month = 1
-                year += 1
-            return d.replace(month=month, year=year)
+            return _advance_months(d, 1)
         elif self.frequency == RecurringFrequency.QUARTERLY:
-            month = d.month + 3
-            year = d.year
-            if month > 12:
-                month -= 12
-                year += 1
-            return d.replace(month=month, year=year)
+            return _advance_months(d, 3)
         elif self.frequency == RecurringFrequency.YEARLY:
             return d.replace(year=d.year + 1)
         return d + timedelta(days=30)  # fallback
@@ -450,6 +452,8 @@ class GuardrailDecision(BaseModel):
     percent_used: float = Field(default=0.0, description="Percent of limit used")
     cooldown_until: Optional[datetime] = Field(default=None, description="If in cooldown, when it expires")
     suggestions: list[str] = Field(default_factory=list, description="Cost-saving suggestions")
+    projection: Optional[ProjectionIntegration] = Field(default=None, description="Spend projection data if used in check")
+    webhooks_fired: int = Field(default=0, description="Number of webhooks notified by this check")
 
 
 class KillSwitch(BaseModel):
@@ -675,19 +679,9 @@ class RecurringIncome(BaseModel):
         elif self.frequency == RecurringFrequency.BIWEEKLY:
             return d + timedelta(weeks=2)
         elif self.frequency == RecurringFrequency.MONTHLY:
-            month = d.month + 1
-            year = d.year
-            if month > 12:
-                month = 1
-                year += 1
-            return d.replace(month=month, year=year)
+            return _advance_months(d, 1)
         elif self.frequency == RecurringFrequency.QUARTERLY:
-            month = d.month + 3
-            year = d.year
-            if month > 12:
-                month -= 12
-                year += 1
-            return d.replace(month=month, year=year)
+            return _advance_months(d, 3)
         elif self.frequency == RecurringFrequency.YEARLY:
             return d.replace(year=d.year + 1)
         return d + timedelta(days=30)  # fallback
@@ -794,7 +788,83 @@ def format_currency(amount: float, currency: str = "USD") -> str:
     return f"{info.symbol}{formatted}"
 
 
+# --- v0.7.0 Guardrail Webhook Models ---
+
+
+class WebhookEvent(str, Enum):
+    """Events that can trigger a webhook notification."""
+    GUARDRAIL_WARN = "guardrail_warn"
+    GUARDRAIL_BLOCK = "guardrail_block"
+    GUARDRAIL_KILL = "guardrail_kill"
+    KILL_SWITCH_TRIGGERED = "kill_switch_triggered"
+    KILL_SWITCH_RESET = "kill_switch_reset"
+    PROJECTION_BREACH = "projection_breach"
+    LOOP_DETECTED = "loop_detected"
+    BUDGET_THRESHOLD = "budget_threshold"
+
+
+class WebhookConfig(BaseModel):
+    """A webhook endpoint registered to receive guardrail/budget notifications.
+
+    When a guardrail triggers (warn/block/kill) or the kill switch activates,
+    all matching webhooks receive a POST with the event details. This enables
+    integration with Slack, Discord, PagerDuty, custom dashboards, etc.
+    """
+    id: str = Field(default_factory=lambda: f"WHK-{uuid.uuid4().hex[:8].upper()}")
+    name: str = Field(min_length=1, description="Webhook name (e.g., 'Slack alerts')")
+    url: str = Field(min_length=1, description="Webhook URL to POST to")
+    events: list[WebhookEvent] = Field(
+        default_factory=lambda: list(WebhookEvent),
+        description="Events that trigger this webhook (default: all)",
+    )
+    # Optional secret for HMAC signing (X-Webhook-Signature header)
+    secret: Optional[str] = Field(default=None, description="Secret for HMAC-SHA256 signing")
+    # Filter by scope (None = all scopes)
+    scope: Optional[GuardrailScope] = Field(default=None, description="Only fire for this scope (None = all)")
+    scope_id: Optional[str] = Field(default=None, description="Only fire for this scope ID")
+    enabled: bool = Field(default=True)
+    # Retry config
+    max_retries: int = Field(default=3, ge=0, le=10, description="Max delivery retries on failure")
+    timeout_seconds: float = Field(default=10.0, ge=1.0, le=120.0, description="Request timeout")
+    # Custom headers
+    headers: dict[str, str] = Field(default_factory=dict, description="Custom headers to send")
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class WebhookDelivery(BaseModel):
+    """Record of a single webhook delivery attempt."""
+    id: str = Field(default_factory=lambda: f"WHD-{uuid.uuid4().hex[:8].upper()}")
+    webhook_id: str = Field(description="Webhook config ID")
+    event: WebhookEvent = Field(description="Event that triggered delivery")
+    payload: dict = Field(default_factory=dict, description="Data sent to the webhook")
+    success: bool = Field(default=False, description="Whether delivery succeeded (2xx response)")
+    status_code: Optional[int] = Field(default=None, description="HTTP status code from response")
+    response_body: Optional[str] = Field(default=None, description="Response body (truncated)")
+    error: Optional[str] = Field(default=None, description="Error message if failed")
+    attempt: int = Field(default=1, ge=1, description="Attempt number (1 = first try)")
+    delivered_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    duration_ms: float = Field(default=0.0, description="Request duration in milliseconds")
+
+
+class ProjectionIntegration(BaseModel):
+    """Result of integrating spend projection into guardrail check.
+
+    When check_guardrails uses projection, it doesn't just check current
+    spend — it projects where spend will be at the end of the period and
+    can proactively warn/block before the actual limit is reached.
+    """
+    enabled: bool = Field(default=False, description="Whether projection was used in this check")
+    projected_spend_usd: Optional[float] = Field(default=None, description="Projected period-end spend")
+    projected_percent: Optional[float] = Field(default=None, description="Projected percent of limit")
+    projected_exceeds: bool = Field(default=False, description="Whether projection exceeds the limit")
+    eta_minutes: Optional[float] = Field(default=None, description="ETA to limit at current rate")
+    will_breach: bool = Field(default=False, description="Whether a guardrail will breach before period end")
+    projection_confidence: float = Field(default=0.0, ge=0, le=1, description="Confidence in projection")
+
+
 # --- Built-in Budget Templates ---
+
 
 BUILTIN_BUDGET_TEMPLATES: list[BudgetTemplate] = [
     BudgetTemplate(
@@ -909,3 +979,6 @@ BUILTIN_BUDGET_TEMPLATES: list[BudgetTemplate] = [
         is_builtin=True,
     ),
 ]
+
+# Rebuild models to resolve forward references
+GuardrailDecision.model_rebuild()

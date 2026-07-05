@@ -40,6 +40,8 @@ class BudgetStore:
         self._killswitch_file = self.data_dir / "killswitch.json"
         self._cost_alerts_file = self.data_dir / "cost_alerts.json"
         self._loop_configs_file = self.data_dir / "loop_configs.json"
+        self._webhooks_file = self.data_dir / "webhooks.json"
+        self._webhook_deliveries_file = self.data_dir / "webhook_deliveries.json"
 
     # --- JSON helpers ---
 
@@ -663,3 +665,61 @@ class BudgetStore:
             return False
         self._write_json(self._loop_configs_file, [c.model_dump() for c in new_configs])
         return True
+
+    # --- v0.7.0 Webhook Storage ---
+
+    def list_webhooks(self, enabled_only: bool = False) -> list:
+        from .models import WebhookConfig
+        data = self._read_json(self._webhooks_file)
+        hooks = [WebhookConfig(**d) for d in data]
+        if enabled_only:
+            hooks = [h for h in hooks if h.enabled]
+        return hooks
+
+    def get_webhook(self, webhook_id: str):
+        for h in self.list_webhooks():
+            if h.id == webhook_id:
+                return h
+        return None
+
+    def save_webhook(self, webhook) -> object:
+        from .models import WebhookConfig
+        hooks = self.list_webhooks()
+        found = False
+        for idx, h in enumerate(hooks):
+            if h.id == webhook.id:
+                hooks[idx] = webhook
+                found = True
+                break
+        if not found:
+            hooks.append(webhook)
+        self._write_json(self._webhooks_file, [h.model_dump() for h in hooks])
+        return webhook
+
+    def delete_webhook(self, webhook_id: str) -> bool:
+        hooks = self.list_webhooks()
+        new_hooks = [h for h in hooks if h.id != webhook_id]
+        if len(new_hooks) == len(hooks):
+            return False
+        self._write_json(self._webhooks_file, [h.model_dump() for h in new_hooks])
+        return True
+
+    def list_webhook_deliveries(self, webhook_id: str | None = None, limit: int = 100) -> list:
+        from .models import WebhookDelivery
+        data = self._read_json(self._webhook_deliveries_file)
+        deliveries = [WebhookDelivery(**d) for d in data]
+        if webhook_id:
+            deliveries = [d for d in deliveries if d.webhook_id == webhook_id]
+        # Sort by delivered_at descending, take limit
+        deliveries.sort(key=lambda d: d.delivered_at, reverse=True)
+        return deliveries[:limit]
+
+    def save_webhook_delivery(self, delivery) -> object:
+        from .models import WebhookDelivery
+        deliveries = self.list_webhook_deliveries(limit=10000)
+        deliveries.append(delivery)
+        # Keep only last 1000 deliveries to avoid unbounded growth
+        if len(deliveries) > 1000:
+            deliveries = deliveries[-1000:]
+        self._write_json(self._webhook_deliveries_file, [d.model_dump() for d in deliveries])
+        return delivery

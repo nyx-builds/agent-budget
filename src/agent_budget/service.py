@@ -18,7 +18,12 @@ from .models import (
     CostGuardrail, GuardrailScope, GuardrailAction, GuardrailDecision,
     KillSwitch, CostAlertEvent,
     SpendProjection, LoopDetectionConfig, LoopDetectionResult,
+    WebhookConfig,
+    WebhookDelivery,
+    WebhookEvent,
+    ProjectionIntegration,
 )
+
 from .store import BudgetStore
 
 
@@ -2212,8 +2217,39 @@ class BudgetService:
                         worst_decision = decision
                     continue
 
-        # If we got a block or warn, return it; otherwise all clear
+        # Fire webhooks if any guardrail triggered
         if worst_decision:
+            if worst_decision.action == GuardrailAction.KILL:
+                wh_event = WebhookEvent.GUARDRAIL_KILL
+            elif worst_decision.action == GuardrailAction.BLOCK:
+                wh_event = WebhookEvent.GUARDRAIL_BLOCK
+            elif worst_decision.action == GuardrailAction.WARN:
+                wh_event = WebhookEvent.GUARDRAIL_WARN
+            else:
+                wh_event = None
+
+            if wh_event:
+                worst_decision.webhooks_fired = self._fire_webhooks(
+                    wh_event,
+                    {
+                        "event": wh_event.value,
+                        "allowed": worst_decision.allowed,
+                        "action": worst_decision.action.value,
+                        "reason": worst_decision.reason,
+                        "guardrail_id": worst_decision.guardrail_id,
+                        "current_spend_usd": worst_decision.current_spend_usd,
+                        "limit_usd": worst_decision.limit_usd,
+                        "percent_used": worst_decision.percent_used,
+                        "estimated_cost_usd": estimated_cost_usd,
+                        "agent_id": agent_id,
+                        "model_id": model_id,
+                        "budget_id": budget_id,
+                        "task_id": task_id,
+                        "suggestions": worst_decision.suggestions,
+                        "timestamp": now.isoformat(),
+                    },
+                )
+
             return worst_decision
 
         return GuardrailDecision(
@@ -2280,7 +2316,21 @@ class BudgetService:
         ks.expires_at = now + timedelta(minutes=expires_in_minutes) if expires_in_minutes else None
         ks.override_token = override_token
         ks.breach_count += 1
-        return self.store.save_kill_switch(ks)
+        saved_ks = self.store.save_kill_switch(ks)
+
+        # Fire kill switch triggered webhook
+        self._fire_webhooks(
+            WebhookEvent.KILL_SWITCH_TRIGGERED,
+            {
+                "event": "kill_switch_triggered",
+                "active": True,
+                "reason": saved_ks.reason,
+                "triggered_by": saved_ks.triggered_by,
+                "breach_count": saved_ks.breach_count,
+                "timestamp": saved_ks.triggered_at.isoformat() if saved_ks.triggered_at else now.isoformat(),
+            },
+        )
+        return saved_ks
 
     def reset_kill_switch(self, override_token: Optional[str] = None) -> KillSwitch:
         """Reset the kill switch, allowing LLM calls again.
@@ -2299,7 +2349,19 @@ class BudgetService:
         ks.triggered_by = None
         ks.expires_at = None
         ks.override_token = None
-        return self.store.save_kill_switch(ks)
+        saved_ks = self.store.save_kill_switch(ks)
+
+        # Fire kill switch reset webhook
+        self._fire_webhooks(
+            WebhookEvent.KILL_SWITCH_RESET,
+            {
+                "event": "kill_switch_reset",
+                "active": False,
+                "breach_count": saved_ks.breach_count,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+        return saved_ks
 
     def get_kill_switch_status(self) -> KillSwitch:
         """Get current kill switch status."""
@@ -2709,3 +2771,348 @@ class BudgetService:
     def delete_loop_config(self, config_id: str) -> bool:
         """Delete a loop detection configuration."""
         return self.store.delete_loop_config(config_id)
+
+    # --- v0.7.0 Guardrail Webhooks ---
+
+    def create_webhook(
+        self,
+        name: str,
+        url: str,
+        events: Optional[list[str]] = None,
+        secret: Optional[str] = None,
+        scope: Optional[str] = None,
+        scope_id: Optional[str] = None,
+        enabled: bool = True,
+        max_retries: int = 3,
+        timeout_seconds: float = 10.0,
+        headers: Optional[dict] = None,
+        description: str = "",
+    ) -> WebhookConfig:
+        """Register a webhook endpoint for guardrail/budget notifications.
+
+        When a guardrail triggers (warn/block/kill), kill switch activates,
+        or projection predicts a breach, matching webhooks receive a POST.
+        """
+        event_enums = []
+        if events:
+            for e in events:
+                try:
+                    event_enums.append(WebhookEvent(e))
+                except ValueError:
+                    raise ValueError(f"Unknown event type: {e}. Valid: {[e.value for e in WebhookEvent]}")
+        else:
+            event_enums = list(WebhookEvent)
+
+        scope_enum = None
+        if scope:
+            try:
+                scope_enum = GuardrailScope(scope)
+            except ValueError:
+                raise ValueError(f"Unknown scope: {scope}. Valid: {[s.value for s in GuardrailScope]}")
+
+        webhook = WebhookConfig(
+            name=name,
+            url=url,
+            events=event_enums,
+            secret=secret,
+            scope=scope_enum,
+            scope_id=scope_id,
+            enabled=enabled,
+            max_retries=max_retries,
+            timeout_seconds=timeout_seconds,
+            headers=headers or {},
+        )
+        self.store.save_webhook(webhook)
+        return webhook
+
+    def update_webhook(self, webhook_id: str, **kwargs) -> WebhookConfig:
+        """Update an existing webhook configuration."""
+        webhook = self.store.get_webhook(webhook_id)
+        if not webhook:
+            raise ValueError(f"Webhook not found: {webhook_id}")
+
+        update_data = kwargs.copy()
+        if 'events' in update_data and update_data['events']:
+            update_data['events'] = [WebhookEvent(e) if isinstance(e, str) else e for e in update_data['events']]
+        if 'scope' in update_data and update_data['scope'] and isinstance(update_data['scope'], str):
+            update_data['scope'] = GuardrailScope(update_data['scope'])
+
+        updated = webhook.model_copy(update=update_data)
+        updated.updated_at = datetime.now(timezone.utc)
+        self.store.save_webhook(updated)
+        return updated
+
+    def list_webhooks(self, enabled_only: bool = False) -> list[WebhookConfig]:
+        """List all registered webhooks."""
+        return self.store.list_webhooks(enabled_only=enabled_only)
+
+    def get_webhook(self, webhook_id: str) -> Optional[WebhookConfig]:
+        """Get a webhook by ID."""
+        return self.store.get_webhook(webhook_id)
+
+    def delete_webhook(self, webhook_id: str) -> bool:
+        """Delete a webhook."""
+        return self.store.delete_webhook(webhook_id)
+
+    def _match_webhooks(
+        self,
+        event: WebhookEvent,
+        scope: Optional[GuardrailScope] = None,
+        scope_id: Optional[str] = None,
+    ) -> list[WebhookConfig]:
+        """Find webhooks that match the given event and scope."""
+        matching = []
+        for hook in self.store.list_webhooks(enabled_only=True):
+            if event not in hook.events:
+                continue
+            if hook.scope and scope:
+                if hook.scope != scope:
+                    continue
+                if hook.scope_id and scope_id:
+                    if hook.scope_id.lower() != scope_id.lower():
+                        continue
+            matching.append(hook)
+        return matching
+
+    def _fire_webhooks(
+        self,
+        event: WebhookEvent,
+        payload: dict,
+        scope: Optional[GuardrailScope] = None,
+        scope_id: Optional[str] = None,
+    ) -> int:
+        """Fire all matching webhooks for an event. Returns count fired.
+
+        Webhook delivery is best-effort: failures are logged but do not
+        block the guardrail decision. Each delivery attempt is recorded.
+        """
+        import urllib.request
+        import hashlib
+        import hmac as hmac_module
+        import json as json_module
+        import time
+
+        matching = self._match_webhooks(event, scope, scope_id)
+        fired = 0
+
+        for hook in matching:
+            body = json_module.dumps(payload, default=str).encode('utf-8')
+
+            headers = dict(hook.headers)
+            headers["Content-Type"] = "application/json"
+            headers["X-Webhook-Event"] = event.value
+            headers["X-Webhook-Id"] = hook.id
+            headers["X-Webhook-Timestamp"] = str(int(time.time()))
+
+            # HMAC signing if secret is set
+            if hook.secret:
+                signature = hmac_module.new(
+                    hook.secret.encode('utf-8'),
+                    body,
+                    hashlib.sha256,
+                ).hexdigest()
+                headers["X-Webhook-Signature"] = f"sha256={signature}"
+
+            success = False
+            status_code = None
+            error_msg = None
+            response_body = None
+
+            for attempt in range(1, hook.max_retries + 1):
+                try:
+                    req = urllib.request.Request(
+                        hook.url,
+                        data=body,
+                        headers=headers,
+                        method="POST",
+                    )
+                    start_time = time.time()
+                    resp = urllib.request.urlopen(req, timeout=hook.timeout_seconds)
+                    duration_ms = (time.time() - start_time) * 1000
+                    status_code = resp.status
+                    response_body = resp.read().decode('utf-8', errors='replace')[:500]
+
+                    if 200 <= status_code < 300:
+                        success = True
+                        break
+                    elif status_code >= 500 and attempt < hook.max_retries:
+                        time.sleep(0.5 * attempt)  # backoff
+                        continue
+                    else:
+                        error_msg = f"HTTP {status_code}"
+                        break
+                except Exception as e:
+                    duration_ms = 0
+                    error_msg = str(e)[:200]
+                    if attempt < hook.max_retries:
+                        time.sleep(0.5 * attempt)
+                        continue
+
+            delivery = WebhookDelivery(
+                webhook_id=hook.id,
+                event=event,
+                payload=payload,
+                success=success,
+                status_code=status_code,
+                response_body=response_body,
+                error=error_msg,
+                attempt=attempt,
+                duration_ms=round(duration_ms, 2),
+            )
+            self.store.save_webhook_delivery(delivery)
+
+            if success:
+                fired += 1
+
+        return fired
+
+    def list_webhook_deliveries(
+        self,
+        webhook_id: Optional[str] = None,
+        limit: int = 50,
+    ) -> list[WebhookDelivery]:
+        """List recent webhook delivery records."""
+        return self.store.list_webhook_deliveries(webhook_id=webhook_id, limit=limit)
+
+    def test_webhook(self, webhook_id: str) -> dict:
+        """Send a test event to a webhook. Returns the delivery result."""
+        webhook = self.store.get_webhook(webhook_id)
+        if not webhook:
+            raise ValueError(f"Webhook not found: {webhook_id}")
+
+        payload = {
+            "test": True,
+            "message": "Test webhook delivery from agent-budget",
+            "webhook_name": webhook.name,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+
+        fired = self._fire_webhooks(
+            WebhookEvent.GUARDRAIL_WARN,
+            payload,
+        )
+
+        return {
+            "webhook_id": webhook_id,
+            "fired": fired,
+            "message": "Test event sent" if fired > 0 else "No webhooks fired (check event filter)",
+        }
+
+    def check_guardrails_with_projection(
+        self,
+        estimated_cost_usd: float = 0.0,
+        agent_id: Optional[str] = None,
+        model_id: Optional[str] = None,
+        budget_id: Optional[str] = None,
+        task_id: Optional[str] = None,
+        use_projection: bool = True,
+        now: Optional[datetime] = None,
+    ) -> GuardrailDecision:
+        """Enhanced guardrail check that integrates spend projection.
+
+        This wraps check_guardrails() but also runs project_spend() to
+        get a forward-looking view. If projection shows the spend will
+        breach a guardrail before period end, the decision includes
+        that warning even if current spend is within limits.
+
+        This is the 'smart' check — agents who want to be proactive
+        (rather than just reactive) should use this.
+        """
+        now = now or datetime.now(timezone.utc)
+
+        # Get the standard guardrail decision
+        decision = self.check_guardrails(
+            estimated_cost_usd=estimated_cost_usd,
+            agent_id=agent_id,
+            model_id=model_id,
+            budget_id=budget_id,
+            task_id=task_id,
+            now=now,
+        )
+
+        if not use_projection:
+            return decision
+
+        # Run projection for the most relevant scope
+        scope = GuardrailScope.GLOBAL
+        scope_id = None
+        if agent_id:
+            scope = GuardrailScope.AGENT
+            scope_id = agent_id
+        elif model_id:
+            scope = GuardrailScope.MODEL
+            scope_id = model_id
+        elif budget_id:
+            scope = GuardrailScope.BUDGET
+            scope_id = budget_id
+        elif task_id:
+            scope = GuardrailScope.TASK
+            scope_id = task_id
+
+        try:
+            projection = self.project_spend(
+                scope=scope,
+                scope_id=scope_id,
+                period="daily",
+                now=now,
+            )
+
+            proj_integration = ProjectionIntegration(
+                enabled=True,
+                projected_spend_usd=projection.projected_spend_usd,
+                projected_percent=(projection.projected_spend_usd / projection.limit_usd * 100)
+                    if projection.limit_usd else None,
+                projected_exceeds=projection.projected_exceeds_limit,
+                eta_minutes=projection.eta_minutes_to_limit,
+                will_breach=projection.will_breach_guardrail,
+                projection_confidence=projection.confidence,
+            )
+            decision.projection = proj_integration
+
+            # If projection says we'll breach and current decision is ALLOW,
+            # upgrade to WARN if confidence is sufficient
+            if (proj_integration.will_breach and
+                decision.allowed and
+                proj_integration.projection_confidence >= 0.4 and
+                proj_integration.projected_percent is not None and
+                proj_integration.projected_percent >= 80):
+                decision.action = GuardrailAction.WARN
+                decision.allowed = True  # still allowed, just warned
+                eta_str = f" ETA to limit: ~{proj_integration.eta_minutes:.0f} min." if proj_integration.eta_minutes else ""
+                proj_msg = (
+                    f"PROJECTION WARNING: At current rate (${projection.spend_rate_per_hour:.2f}/hr), "
+                    f"daily spend will reach ${projection.projected_spend_usd:.2f} "
+                    f"({proj_integration.projected_percent:.0f}% of limit) by end of day.{eta_str}"
+                )
+                decision.reason = decision.reason + " | " + proj_msg if decision.reason else proj_msg
+                decision.suggestions.append(
+                    f"Projected to breach — consider switching to a cheaper model or reducing call frequency"
+                )
+
+                # Fire projection breach webhook
+                fired = self._fire_webhooks(
+                    WebhookEvent.PROJECTION_BREACH,
+                    {
+                        "scope": scope.value,
+                        "scope_id": scope_id,
+                        "projected_spend_usd": projection.projected_spend_usd,
+                        "limit_usd": projection.limit_usd,
+                        "projected_percent": proj_integration.projected_percent,
+                        "eta_minutes": proj_integration.eta_minutes,
+                        "confidence": proj_integration.projection_confidence,
+                        "recommendation": projection.recommendation,
+                        "agent_id": agent_id,
+                        "model_id": model_id,
+                        "task_id": task_id,
+                        "timestamp": now.isoformat(),
+                    },
+                    scope=scope,
+                    scope_id=scope_id,
+                )
+                decision.webhooks_fired += fired
+
+        except Exception:
+            # Projection is best-effort; don't fail the guardrail check
+            pass
+
+        return decision

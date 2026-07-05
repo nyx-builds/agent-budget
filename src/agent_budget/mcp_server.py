@@ -1597,6 +1597,135 @@ def delete_loop_config(config_id: str) -> str:
     return json.dumps({"deleted": deleted, "config_id": config_id}, indent=2)
 
 
+
+
+@mcp.tool()
+def create_webhook(
+    name: str,
+    url: str,
+    events: str | None = None,
+    secret: str | None = None,
+    scope: str | None = None,
+    scope_id: str | None = None,
+    max_retries: int = 3,
+    timeout_seconds: float = 10.0,
+) -> str:
+    """Register a webhook endpoint for guardrail/budget notifications.
+
+    When guardrails trigger (warn/block/kill) or the kill switch activates,
+    matching webhooks receive a POST with event details. Enables integration
+    with Slack, Discord, PagerDuty, custom dashboards, etc.
+
+    Args:
+        name: Webhook name (e.g., 'Slack #alerts')
+        url: Webhook URL to POST to
+        events: Comma-separated event types (default: all). Options:
+            guardrail_warn, guardrail_block, guardrail_kill,
+            kill_switch_triggered, kill_switch_reset,
+            projection_breach, loop_detected, budget_threshold
+        secret: Optional HMAC-SHA256 signing secret
+        scope: Filter to scope (global, agent, model, budget, task)
+        scope_id: Filter to specific scope ID
+        max_retries: Max delivery retries on failure (default 3)
+        timeout_seconds: Request timeout (default 10)
+    """
+    svc = get_service()
+    event_list = events.split(",") if events else None
+    webhook = svc.create_webhook(
+        name=name,
+        url=url,
+        events=event_list,
+        secret=secret,
+        scope=scope,
+        scope_id=scope_id,
+        max_retries=max_retries,
+        timeout_seconds=timeout_seconds,
+    )
+    return json.dumps(webhook.model_dump(), default=str, indent=2)
+
+
+@mcp.tool()
+def list_webhooks(enabled_only: bool = True) -> str:
+    """List all registered webhooks.
+
+    Args:
+        enabled_only: Only show enabled webhooks (default True)
+    """
+    svc = get_service()
+    webhooks = svc.list_webhooks(enabled_only=enabled_only)
+    return json.dumps([w.model_dump() for w in webhooks], default=str, indent=2)
+
+
+@mcp.tool()
+def delete_webhook(webhook_id: str) -> str:
+    """Delete a webhook endpoint.
+
+    Args:
+        webhook_id: Webhook ID (starts with 'WHK-')
+    """
+    svc = get_service()
+    deleted = svc.delete_webhook(webhook_id)
+    return json.dumps({"deleted": deleted, "webhook_id": webhook_id})
+
+
+@mcp.tool()
+def test_webhook(webhook_id: str) -> str:
+    """Send a test event to a webhook to verify it works.
+
+    Args:
+        webhook_id: Webhook ID to test (starts with 'WHK-')
+    """
+    svc = get_service()
+    result = svc.test_webhook(webhook_id)
+    return json.dumps(result, default=str, indent=2)
+
+
+@mcp.tool()
+def list_webhook_deliveries(webhook_id: str | None = None, limit: int = 50) -> str:
+    """List recent webhook delivery records.
+
+    Args:
+        webhook_id: Filter by webhook ID (optional)
+        limit: Max deliveries to return (default 50)
+    """
+    svc = get_service()
+    deliveries = svc.list_webhook_deliveries(webhook_id=webhook_id, limit=limit)
+    return json.dumps([d.model_dump() for d in deliveries], default=str, indent=2)
+
+
+@mcp.tool()
+def check_guardrails_smart(
+    estimated_cost_usd: float = 0.0,
+    agent_id: str | None = None,
+    model_id: str | None = None,
+    budget_id: str | None = None,
+    task_id: str | None = None,
+) -> str:
+    """Enhanced guardrail check with spend projection integration.
+
+    Like check_cost_guardrail, but also runs a spend projection to warn
+    proactively if current spending rate will breach a guardrail before
+    period end. Use this for 'smart' pre-flight checks that anticipate
+    breaches rather than just reacting to them.
+
+    Args:
+        estimated_cost_usd: Estimated cost of the upcoming LLM call
+        agent_id: Agent making the call
+        model_id: Model being called
+        budget_id: Associated budget
+        task_id: Task/session ID
+    """
+    svc = get_service()
+    decision = svc.check_guardrails_with_projection(
+        estimated_cost_usd=estimated_cost_usd,
+        agent_id=agent_id,
+        model_id=model_id,
+        budget_id=budget_id,
+        task_id=task_id,
+    )
+    return json.dumps(decision.model_dump(), default=str, indent=2)
+
+
 def run_server():
     """Run the MCP server."""
     mcp.run()

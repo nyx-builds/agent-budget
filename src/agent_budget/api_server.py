@@ -1138,6 +1138,79 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=404, detail="Config not found")
         return {"deleted": True, "config_id": config_id}
 
+
+    # --- v0.7.0 Webhook Endpoints ---
+
+    @app.post("/webhooks")
+    def create_webhook(body: dict):
+        """Register a webhook endpoint."""
+        svc = get_service()
+        events = body.get("events")
+        if isinstance(events, str):
+            events = [e.strip() for e in events.split(",")]
+        webhook = svc.create_webhook(
+            name=body["name"],
+            url=body["url"],
+            events=events,
+            secret=body.get("secret"),
+            scope=body.get("scope"),
+            scope_id=body.get("scope_id"),
+            max_retries=body.get("max_retries", 3),
+            timeout_seconds=body.get("timeout_seconds", 10.0),
+            headers=body.get("headers"),
+        )
+        return webhook.model_dump(mode="json")
+
+    @app.get("/webhooks")
+    def list_webhooks(enabled_only: bool = True):
+        """List all webhooks."""
+        svc = get_service()
+        return [w.model_dump(mode="json") for w in svc.list_webhooks(enabled_only=enabled_only)]
+
+    @app.get("/webhooks/{webhook_id}")
+    def get_webhook(webhook_id: str):
+        """Get a webhook by ID."""
+        svc = get_service()
+        webhook = svc.get_webhook(webhook_id)
+        if not webhook:
+            raise HTTPException(status_code=404, detail="Webhook not found")
+        return webhook.model_dump(mode="json")
+
+    @app.delete("/webhooks/{webhook_id}")
+    def delete_webhook(webhook_id: str):
+        """Delete a webhook."""
+        svc = get_service()
+        deleted = svc.delete_webhook(webhook_id)
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Webhook not found")
+        return {"deleted": True, "webhook_id": webhook_id}
+
+    @app.post("/webhooks/{webhook_id}/test")
+    def test_webhook(webhook_id: str):
+        """Send a test event to a webhook."""
+        svc = get_service()
+        result = svc.test_webhook(webhook_id)
+        return result
+
+    @app.get("/webhooks/{webhook_id}/deliveries")
+    def webhook_deliveries(webhook_id: str, limit: int = 50):
+        """List delivery records for a webhook."""
+        svc = get_service()
+        return [d.model_dump(mode="json") for d in svc.list_webhook_deliveries(webhook_id=webhook_id, limit=limit)]
+
+    @app.post("/guardrails/check-smart")
+    def check_guardrails_smart(body: dict):
+        """Enhanced guardrail check with spend projection."""
+        svc = get_service()
+        decision = svc.check_guardrails_with_projection(
+            estimated_cost_usd=body.get("estimated_cost_usd", 0.0),
+            agent_id=body.get("agent_id"),
+            model_id=body.get("model_id"),
+            budget_id=body.get("budget_id"),
+            task_id=body.get("task_id"),
+        )
+        return decision.model_dump(mode="json")
+
     return app
 
 

@@ -4,6 +4,17 @@ MCP server + CLI for autonomous agents to manage budgets, track expenses, contro
 
 ## Features
 
+### v0.7.0 — Guardrail Webhooks & Smart Projection Check 🔔
+- **Webhook Notifications** — Register webhook endpoints that fire when guardrails trigger (warn/block/kill), kill switch activates, or projection predicts a breach
+- **Event Filtering** — Subscribe to specific events: `guardrail_warn`, `guardrail_block`, `guardrail_kill`, `kill_switch_triggered`, `kill_switch_reset`, `projection_breach`, `loop_detected`, `budget_threshold`
+- **Scope Filtering** — Filter webhooks by guardrail scope (global/agent/model/budget/task) and scope ID
+- **HMAC-SHA256 Signing** — Optional secret for request signature verification (`X-Webhook-Signature` header)
+- **Retry with Backoff** — Automatic retries on 5xx errors with exponential backoff; configurable max retries
+- **Delivery Records** — Full audit trail of every webhook delivery attempt (success/failure, status code, response body, duration)
+- **Test Endpoint** — Send a test event to verify webhook configuration before going live
+- **Smart Projection Check** — `check_guardrails_with_projection()` combines real-time guardrail check with forward-looking spend projection for proactive breach detection
+- **Slack/Discord/PagerDuty Ready** — Standard JSON POST payloads with event metadata; works out-of-the-box with popular notification services
+
 ### v0.6.0 — Spend Projection & Loop Detection 🔮
 - **Burn Forecast** — `project_spend()` predicts when limits will be hit based on spend velocity; returns ETA-to-limit, projected spend, and recommendations
 - **Multi-period Projections** — Daily, hourly, and monthly spend projections with confidence scoring
