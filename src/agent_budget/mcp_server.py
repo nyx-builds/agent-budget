@@ -1347,6 +1347,7 @@ def create_cost_guardrail(
     warn_at_percent: float = 80.0,
     block_at_percent: float = 100.0,
     cooldown_minutes: int = 0,
+    throttle_enabled: bool = False,
     priority: int = 0,
     description: str = "",
 ) -> str:
@@ -1355,6 +1356,12 @@ def create_cost_guardrail(
     Guardrails are checked before each LLM call (via check_cost_guardrail).
     Unlike spending rules (which check expenses after-the-fact), guardrails
     are pre-flight checks that can BLOCK calls before they happen.
+
+    v0.8.0: Set throttle_enabled=True to activate progressive cost throttling.
+    When enabled, the guardrail uses graduated spend tiers (60%, 75%, 90%)
+    that recommend max per-call costs and model downgrades BEFORE hitting
+    the hard block threshold. This enables graceful degradation instead of
+    a cliff-edge cutoff.
 
     Args:
         name: Guardrail name (e.g., 'Daily LLM cap')
@@ -1367,6 +1374,7 @@ def create_cost_guardrail(
         warn_at_percent: Percent of limit to start warning (default 80)
         block_at_percent: Percent of limit to block at (default 100)
         cooldown_minutes: If breached, block calls for N minutes
+        throttle_enabled: Enable progressive cost throttling (default False)
         priority: Higher priority checked first (default 0)
         description: Optional description
     """
@@ -1383,6 +1391,7 @@ def create_cost_guardrail(
             warn_at_percent=warn_at_percent,
             block_at_percent=block_at_percent,
             cooldown_minutes=cooldown_minutes,
+            throttle_enabled=throttle_enabled,
             priority=priority,
             description=description,
         )
@@ -1413,6 +1422,40 @@ def delete_cost_guardrail(guardrail_id: str) -> str:
     svc = get_service()
     deleted = svc.delete_guardrail(guardrail_id)
     return json.dumps({"deleted": deleted, "guardrail_id": guardrail_id})
+
+
+@mcp.tool()
+def enable_progressive_throttling(
+    guardrail_id: str,
+    enabled: bool = True,
+) -> str:
+    """Enable or disable progressive cost throttling on a guardrail.
+
+    v0.8.0: Progressive throttling provides graceful spend degradation.
+    Instead of a binary allow/block, the guardrail activates graduated
+    cost tiers as spend increases:
+
+      - 60% of limit: recommend max $0.50/call, reduce context
+      - 75% of limit: recommend max $0.20/call, switch to cheaper model
+      - 90% of limit: hard cap at $0.05/call (blocks expensive calls)
+
+    This prevents "cliff edge" behavior where an agent goes from full-speed
+    to completely blocked with no intermediate signal.
+
+    Args:
+        guardrail_id: The guardrail ID (starts with 'GDR-')
+        enabled: True to enable throttling, False to disable
+    """
+    svc = get_service()
+    try:
+        guardrail = svc.update_guardrail(guardrail_id, throttle_enabled=enabled)
+        return json.dumps({
+            "guardrail_id": guardrail.id,
+            "throttle_enabled": guardrail.throttle_enabled,
+            "throttle_tiers": [t.model_dump() for t in guardrail.throttle_tiers],
+        }, default=str, indent=2)
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
 
 
 @mcp.tool()

@@ -22,6 +22,7 @@ from .models import (
     WebhookDelivery,
     WebhookEvent,
     ProjectionIntegration,
+    ThrottleTier, DEFAULT_THROTTLE_TIERS,
 )
 
 from .store import BudgetStore
@@ -1870,6 +1871,8 @@ class BudgetService:
         warn_at_percent: float = 80.0,
         block_at_percent: float = 100.0,
         cooldown_minutes: int = 0,
+        throttle_enabled: bool = False,
+        throttle_tiers: Optional[list] = None,
         enabled: bool = True,
         priority: int = 0,
         description: str = "",
@@ -1877,6 +1880,10 @@ class BudgetService:
         """Create a cost guardrail.
 
         At least one limit (daily, hourly, per_call, monthly) must be set.
+
+        v0.8.0: If ``throttle_enabled`` is True, progressive cost throttling
+        is activated between warn and block thresholds. ``throttle_tiers``
+        overrides the default tiers if provided.
         """
         if not any([daily_limit_usd, hourly_limit_usd, per_call_limit_usd, monthly_limit_usd]):
             raise ValueError("At least one limit must be set (daily, hourly, per_call, or monthly)")
@@ -1892,6 +1899,8 @@ class BudgetService:
             warn_at_percent=warn_at_percent,
             block_at_percent=block_at_percent,
             cooldown_minutes=cooldown_minutes,
+            throttle_enabled=throttle_enabled,
+            throttle_tiers=throttle_tiers if throttle_tiers is not None else list(DEFAULT_THROTTLE_TIERS),
             enabled=enabled,
             priority=priority,
             description=description,
@@ -1909,6 +1918,8 @@ class BudgetService:
         warn_at_percent: Optional[float] = None,
         block_at_percent: Optional[float] = None,
         cooldown_minutes: Optional[int] = None,
+        throttle_enabled: Optional[bool] = None,
+        throttle_tiers: Optional[list] = None,
         enabled: Optional[bool] = None,
         priority: Optional[int] = None,
         description: Optional[str] = None,
@@ -1934,6 +1945,10 @@ class BudgetService:
             guardrail.block_at_percent = block_at_percent
         if cooldown_minutes is not None:
             guardrail.cooldown_minutes = cooldown_minutes
+        if throttle_enabled is not None:
+            guardrail.throttle_enabled = throttle_enabled
+        if throttle_tiers is not None:
+            guardrail.throttle_tiers = throttle_tiers
         if enabled is not None:
             guardrail.enabled = enabled
         if priority is not None:
@@ -2130,6 +2145,18 @@ class BudgetService:
                     if worst_decision is None or decision.action.value > worst_decision.action.value:
                         worst_decision = decision
                     continue
+                elif g.throttle_enabled:
+                    # Check progressive throttle tiers
+                    throttle_decision = self._check_throttle_tier(
+                        g, estimated_cost_usd, pct, daily_spend, g.daily_limit_usd, "daily"
+                    )
+                    if throttle_decision:
+                        self._record_cost_alert(g, throttle_decision, AlertLevel.WARNING)
+                        if worst_decision is None or (worst_decision.allowed and not throttle_decision.allowed):
+                            worst_decision = throttle_decision
+                        elif worst_decision and worst_decision.action == GuardrailAction.WARN and throttle_decision.action == GuardrailAction.THROTTLE:
+                            worst_decision = throttle_decision
+                        continue
                 elif pct >= g.warn_at_percent:
                     decision = GuardrailDecision(
                         allowed=True,
@@ -2166,6 +2193,17 @@ class BudgetService:
                     if worst_decision is None or decision.action.value > worst_decision.action.value:
                         worst_decision = decision
                     continue
+                elif g.throttle_enabled:
+                    throttle_decision = self._check_throttle_tier(
+                        g, estimated_cost_usd, pct, hourly_spend, g.hourly_limit_usd, "hourly"
+                    )
+                    if throttle_decision:
+                        self._record_cost_alert(g, throttle_decision, AlertLevel.WARNING)
+                        if worst_decision is None or (worst_decision.allowed and not throttle_decision.allowed):
+                            worst_decision = throttle_decision
+                        elif worst_decision and worst_decision.action == GuardrailAction.WARN and throttle_decision.action == GuardrailAction.THROTTLE:
+                            worst_decision = throttle_decision
+                        continue
                 elif pct >= g.warn_at_percent:
                     decision = GuardrailDecision(
                         allowed=True,
@@ -2202,6 +2240,17 @@ class BudgetService:
                     if worst_decision is None or decision.action.value > worst_decision.action.value:
                         worst_decision = decision
                     continue
+                elif g.throttle_enabled:
+                    throttle_decision = self._check_throttle_tier(
+                        g, estimated_cost_usd, pct, monthly_spend, g.monthly_limit_usd, "monthly"
+                    )
+                    if throttle_decision:
+                        self._record_cost_alert(g, throttle_decision, AlertLevel.WARNING)
+                        if worst_decision is None or (worst_decision.allowed and not throttle_decision.allowed):
+                            worst_decision = throttle_decision
+                        elif worst_decision and worst_decision.action == GuardrailAction.WARN and throttle_decision.action == GuardrailAction.THROTTLE:
+                            worst_decision = throttle_decision
+                        continue
                 elif pct >= g.warn_at_percent:
                     decision = GuardrailDecision(
                         allowed=True,
@@ -2223,6 +2272,8 @@ class BudgetService:
                 wh_event = WebhookEvent.GUARDRAIL_KILL
             elif worst_decision.action == GuardrailAction.BLOCK:
                 wh_event = WebhookEvent.GUARDRAIL_BLOCK
+            elif worst_decision.action == GuardrailAction.THROTTLE:
+                wh_event = WebhookEvent.BUDGET_THRESHOLD
             elif worst_decision.action == GuardrailAction.WARN:
                 wh_event = WebhookEvent.GUARDRAIL_WARN
             else:
@@ -2245,6 +2296,9 @@ class BudgetService:
                         "model_id": model_id,
                         "budget_id": budget_id,
                         "task_id": task_id,
+                        "throttle_tier": worst_decision.throttle_tier,
+                        "max_recommended_cost_usd": worst_decision.max_recommended_cost_usd,
+                        "recommended_model": worst_decision.recommended_model,
                         "suggestions": worst_decision.suggestions,
                         "timestamp": now.isoformat(),
                     },
@@ -2257,6 +2311,68 @@ class BudgetService:
             action=GuardrailAction.ALLOW,
             reason="All guardrails passed — within all limits",
             current_spend_usd=0.0,
+        )
+
+    def _check_throttle_tier(
+        self,
+        guardrail: CostGuardrail,
+        estimated_cost_usd: float,
+        pct: float,
+        current_spend: float,
+        limit: float,
+        period_label: str,
+    ) -> Optional[GuardrailDecision]:
+        """Check if the current spend level triggers a throttle tier.
+
+        Progressive throttling sits between WARN and BLOCK. Instead of a
+        binary allow/deny, it recommends a max per-call cost and optionally
+        a cheaper model. If ``block_if_exceeded`` is True on the active tier,
+        calls above ``max_cost_usd`` are hard-blocked.
+
+        Returns a GuardrailDecision if a throttle tier is active, or None.
+        """
+        tier = guardrail.get_active_throttle_tier(pct)
+        if tier is None:
+            return None
+
+        # Determine if this call exceeds the tier's max cost
+        exceeds = (
+            tier.max_cost_usd is not None
+            and estimated_cost_usd > tier.max_cost_usd
+        )
+
+        blocked = exceeds and tier.block_if_exceeded
+
+        suggestions = []
+        if tier.max_cost_usd is not None:
+            suggestions.append(f"Reduce per-call cost to ≤${tier.max_cost_usd:.4f}")
+        if tier.recommended_model:
+            suggestions.append(f"Switch to model: {tier.recommended_model}")
+        suggestions.append(f"Current tier: {tier.threshold_percent:.0f}% of {period_label} limit")
+
+        reason_parts = [
+            f"THROTTLE @ {tier.threshold_percent:.0f}%: {tier.message}" if tier.message
+            else f"THROTTLE: {period_label} spend at {pct:.1f}% (${current_spend:.2f}/${limit:.2f})",
+        ]
+        if tier.max_cost_usd is not None:
+            reason_parts.append(f"max per-call: ${tier.max_cost_usd:.4f}")
+        if tier.recommended_model:
+            reason_parts.append(f"recommended model: {tier.recommended_model}")
+        if blocked:
+            reason_parts.append(f"COST BLOCKED: ${estimated_cost_usd:.4f} exceeds tier max ${tier.max_cost_usd:.4f}")
+
+        return GuardrailDecision(
+            allowed=not blocked,
+            action=GuardrailAction.BLOCK if blocked else GuardrailAction.THROTTLE,
+            reason=" — ".join(reason_parts),
+            guardrail_id=guardrail.id,
+            current_spend_usd=current_spend,
+            limit_usd=limit,
+            percent_used=pct,
+            suggestions=suggestions,
+            throttle_tier=f"{tier.threshold_percent:.0f}%",
+            max_recommended_cost_usd=tier.max_cost_usd,
+            recommended_model=tier.recommended_model,
         )
 
     def _record_cost_alert(

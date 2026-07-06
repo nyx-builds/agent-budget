@@ -985,6 +985,7 @@ def create_app() -> FastAPI:
             warn_at_percent=body.get("warn_at_percent", 80.0),
             block_at_percent=body.get("block_at_percent", 100.0),
             cooldown_minutes=body.get("cooldown_minutes", 0),
+            throttle_enabled=body.get("throttle_enabled", False),
             enabled=body.get("enabled", True),
             priority=body.get("priority", 0),
             description=body.get("description", ""),
@@ -1002,6 +1003,17 @@ def create_app() -> FastAPI:
         g = svc.get_guardrail(guardrail_id)
         if not g:
             raise HTTPException(status_code=404, detail="Guardrail not found")
+        return g.model_dump(mode="json")
+
+    @app.patch("/guardrails/{guardrail_id}/throttle")
+    def update_throttle(guardrail_id: str, body: dict):
+        """Enable/disable progressive throttling or update tiers."""
+        svc = get_service()
+        g = svc.update_guardrail(
+            guardrail_id,
+            throttle_enabled=body.get("enabled"),
+            throttle_tiers=body.get("tiers"),
+        )
         return g.model_dump(mode="json")
 
     @app.delete("/guardrails/{guardrail_id}")

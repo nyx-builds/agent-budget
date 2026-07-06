@@ -404,6 +404,48 @@ class GuardrailAction(str, Enum):
     KILL = "kill"             # kill switch active, all calls denied
 
 
+class ThrottleTier(BaseModel):
+    """A spending tier that triggers progressive cost throttling.
+
+    When the agent's spend reaches ``threshold_percent`` of the limit, the
+    guardrail recommends ``max_cost_usd`` — the largest per-call cost still
+    allowed.  This enables graceful degradation (e.g., switch from GPT-4o
+    to GPT-4o-mini at 70% spend, or cap context at 95%).
+
+    Throttling is advisory: the agent SHOULD respect ``max_cost_usd``, but
+    the guardrail does not hard-block unless ``block_if_exceeded`` is True.
+    """
+    threshold_percent: float = Field(ge=0, le=100, description="Spend percentage that triggers this tier")
+    max_cost_usd: Optional[float] = Field(default=None, ge=0, description="Max per-call cost in this tier (None = advisory only)")
+    recommended_model: Optional[str] = Field(default=None, description="Cheaper model to switch to (advisory)")
+    block_if_exceeded: bool = Field(default=False, description="If True, calls above max_cost_usd are blocked (not just warned)")
+    message: str = Field(default="", description="Human-readable throttle instruction")
+
+
+# Default throttle tiers: graceful degradation as budget depletes
+DEFAULT_THROTTLE_TIERS: list[ThrottleTier] = [
+    ThrottleTier(
+        threshold_percent=60.0,
+        max_cost_usd=0.50,
+        recommended_model=None,
+        message="Spend at 60% — consider reducing context size",
+    ),
+    ThrottleTier(
+        threshold_percent=75.0,
+        max_cost_usd=0.20,
+        recommended_model="gpt-4o-mini",
+        message="Spend at 75% — switch to cheaper model, reduce token count",
+    ),
+    ThrottleTier(
+        threshold_percent=90.0,
+        max_cost_usd=0.05,
+        recommended_model="gpt-4o-mini",
+        block_if_exceeded=True,
+        message="Spend at 90% — emergency throttle: only very cheap calls allowed",
+    ),
+]
+
+
 class CostGuardrail(BaseModel):
     """A cost guardrail that enforces spending limits for agents in real time.
 
@@ -422,6 +464,12 @@ class CostGuardrail(BaseModel):
     warn_at_percent: float = Field(default=80.0, ge=0, le=100, description="Percent of limit to warn at")
     block_at_percent: float = Field(default=100.0, ge=0, le=100, description="Percent of limit to block at")
     cooldown_minutes: int = Field(default=0, ge=0, description="If breached, block calls for N minutes")
+    # v0.8.0: Progressive throttling tiers
+    throttle_enabled: bool = Field(default=False, description="Enable progressive cost throttling between warn and block")
+    throttle_tiers: list[ThrottleTier] = Field(
+        default_factory=lambda: list(DEFAULT_THROTTLE_TIERS),
+        description="Spend tiers that trigger graduated cost throttling",
+    )
     enabled: bool = Field(default=True)
     priority: int = Field(default=0, ge=0, description="Higher priority checked first")
     description: str = Field(default="")
@@ -440,6 +488,22 @@ class CostGuardrail(BaseModel):
             return self.scope_id.lower() == scope_id.lower()
         return self.scope_id is None
 
+    def get_active_throttle_tier(self, percent_used: float) -> Optional[ThrottleTier]:
+        """Find the highest throttle tier whose threshold has been reached.
+
+        Returns the most restrictive applicable tier, or None if throttling
+        is disabled or no tier threshold has been crossed yet.
+        """
+        if not self.throttle_enabled or not self.throttle_tiers:
+            return None
+        active = None
+        for tier in sorted(self.throttle_tiers, key=lambda t: t.threshold_percent):
+            if percent_used >= tier.threshold_percent:
+                active = tier
+            else:
+                break
+        return active
+
 
 class GuardrailDecision(BaseModel):
     """Result of a guardrail pre-flight check."""
@@ -454,6 +518,10 @@ class GuardrailDecision(BaseModel):
     suggestions: list[str] = Field(default_factory=list, description="Cost-saving suggestions")
     projection: Optional[ProjectionIntegration] = Field(default=None, description="Spend projection data if used in check")
     webhooks_fired: int = Field(default=0, description="Number of webhooks notified by this check")
+    # v0.8.0: Throttle info
+    throttle_tier: Optional[str] = Field(default=None, description="Active throttle tier name/percent if throttled")
+    max_recommended_cost_usd: Optional[float] = Field(default=None, description="Max per-call cost recommended by active throttle tier")
+    recommended_model: Optional[str] = Field(default=None, description="Cheaper model recommended by throttle tier")
 
 
 class KillSwitch(BaseModel):
