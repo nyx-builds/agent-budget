@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from datetime import date, datetime
 from pathlib import Path
 from typing import Optional
@@ -14,6 +15,7 @@ from .models import (
     Income, RecurringIncome, IncomeStatus,
     CostGuardrail, KillSwitch, CostAlertEvent,
     LoopDetectionConfig,
+    SpendReservation, ReservationStatus,
 )
 from .llm_costs import LLMUsageRecord, ModelPrice, ModelProvider
 
@@ -42,6 +44,11 @@ class BudgetStore:
         self._loop_configs_file = self.data_dir / "loop_configs.json"
         self._webhooks_file = self.data_dir / "webhooks.json"
         self._webhook_deliveries_file = self.data_dir / "webhook_deliveries.json"
+        self._reservations_file = self.data_dir / "reservations.json"
+        # v0.9.0: Process-wide lock so concurrent guardrail check+reserve
+        # operations are atomic within a single Python process.  This is the
+        # mechanism that makes the reserve/settle protocol hold under fan-out.
+        self._lock = threading.RLock()
 
     # --- JSON helpers ---
 
@@ -723,3 +730,89 @@ class BudgetStore:
             deliveries = deliveries[-1000:]
         self._write_json(self._webhook_deliveries_file, [d.model_dump() for d in deliveries])
         return delivery
+
+    # --- v0.9.0 Reservations (reserve/settle protocol) ---
+
+    def save_reservation(self, reservation: SpendReservation) -> SpendReservation:
+        """Create or update a reservation (thread-safe)."""
+        with self._lock:
+            data = self._read_json(self._reservations_file)
+            records = [SpendReservation(**d) for d in data]
+            found = False
+            for idx, r in enumerate(records):
+                if r.id == reservation.id:
+                    records[idx] = reservation
+                    found = True
+                    break
+            if not found:
+                records.append(reservation)
+            self._write_json(self._reservations_file, [r.model_dump() for r in records])
+            return reservation
+
+    def get_reservation(self, reservation_id: str) -> Optional[SpendReservation]:
+        """Fetch a single reservation by ID."""
+        with self._lock:
+            for r in self.list_reservations():
+                if r.id == reservation_id:
+                    return r
+        return None
+
+    def list_reservations(
+        self,
+        status: Optional[ReservationStatus] = None,
+        agent_id: Optional[str] = None,
+        active_only: bool = False,
+        now: Optional[datetime] = None,
+    ) -> list[SpendReservation]:
+        """List reservations with optional filters.
+
+        When ``active_only`` is True, only reservations that still count
+        against the budget (status=ACTIVE and not expired) are returned.
+        """
+        from datetime import datetime as _dt, timezone as _tz
+        now = now or _dt.now(_tz.utc)
+        with self._lock:
+            data = self._read_json(self._reservations_file)
+            records = [SpendReservation(**d) for d in data]
+        if active_only:
+            records = [r for r in records if r.is_active(now)]
+        if status is not None:
+            records = [r for r in records if r.status == status]
+        if agent_id:
+            records = [r for r in records if r.agent_id and r.agent_id.lower() == agent_id.lower()]
+        records.sort(key=lambda r: r.created_at, reverse=True)
+        return records
+
+    def delete_reservation(self, reservation_id: str) -> bool:
+        """Remove a reservation entirely (hard delete)."""
+        with self._lock:
+            records = self.list_reservations()
+            new_records = [r for r in records if r.id != reservation_id]
+            if len(new_records) == len(records):
+                return False
+            self._write_json(self._reservations_file, [r.model_dump() for r in new_records])
+            return True
+
+    def expire_stale_reservations(self, now: Optional[datetime] = None) -> int:
+        """Mark ACTIVE reservations past their TTL as EXPIRED.
+
+        Returns the count of newly-expired reservations.  This should be
+        called periodically (e.g. at the top of each guardrail check) so
+        that crashed/abandoned calls eventually release their budget.
+        """
+        from datetime import datetime as _dt, timezone as _tz
+        now = now or _dt.now(_tz.utc)
+        expired_count = 0
+        with self._lock:
+            records = self.list_reservations()
+            changed = False
+            for idx, r in enumerate(records):
+                if r.status == ReservationStatus.ACTIVE and now > r.expires_at:
+                    records[idx] = r.model_copy(update={
+                        "status": ReservationStatus.EXPIRED,
+                    })
+                    changed = True
+                    expired_count += 1
+            if changed:
+                self._write_json(self._reservations_file, [r.model_dump() for r in records])
+        return expired_count

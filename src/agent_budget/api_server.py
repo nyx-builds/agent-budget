@@ -1223,6 +1223,83 @@ def create_app() -> FastAPI:
         )
         return decision.model_dump(mode="json")
 
+    # === v0.9.0 Reserve/Settle Protocol ===
+
+    @app.post("/reservations/reserve-and-check")
+    def reserve_and_check(body: dict):
+        """Atomically check guardrails and reserve budget for an in-flight call."""
+        svc = get_service()
+        decision, reservation = svc.reserve_and_check(
+            estimated_cost_usd=body.get("estimated_cost_usd", 0.0),
+            agent_id=body.get("agent_id"),
+            model_id=body.get("model_id"),
+            budget_id=body.get("budget_id"),
+            task_id=body.get("task_id"),
+            ttl_minutes=body.get("ttl_minutes", 5),
+        )
+        return {
+            "decision": decision.model_dump(mode="json"),
+            "reservation_id": reservation.id if reservation else None,
+            "reservation": reservation.model_dump(mode="json") if reservation else None,
+        }
+
+    @app.post("/reservations/{reservation_id}/settle")
+    def settle_reservation(reservation_id: str, body: dict):
+        """Settle a reservation with actual usage data."""
+        svc = get_service()
+        try:
+            settled = svc.settle_reservation(
+                reservation_id=reservation_id,
+                actual_cost_usd=body.get("actual_cost_usd", 0.0),
+                input_tokens=body.get("input_tokens", 0),
+                output_tokens=body.get("output_tokens", 0),
+                model_id=body.get("model_id"),
+            )
+            return settled.model_dump(mode="json")
+        except ValueError as e:
+            from fastapi import HTTPException
+            raise HTTPException(status_code=404, detail=str(e))
+
+    @app.post("/reservations/{reservation_id}/release")
+    def release_reservation(reservation_id: str, body: dict | None = None):
+        """Release a reservation without settling."""
+        body = body or {}
+        svc = get_service()
+        try:
+            released = svc.release_reservation(
+                reservation_id=reservation_id,
+                reason=body.get("reason", "released"),
+            )
+            return released.model_dump(mode="json")
+        except ValueError as e:
+            from fastapi import HTTPException
+            raise HTTPException(status_code=404, detail=str(e))
+
+    @app.get("/reservations")
+    def list_reservations(
+        status: str | None = None,
+        agent_id: str | None = None,
+        active_only: bool = False,
+    ):
+        """List spend reservations."""
+        from .models import ReservationStatus
+        svc = get_service()
+        status_enum = ReservationStatus(status) if status else None
+        reservations = svc.list_reservations(
+            status=status_enum, agent_id=agent_id, active_only=active_only,
+        )
+        return [r.model_dump(mode="json") for r in reservations]
+
+    @app.get("/reservations/{reservation_id}")
+    def get_reservation(reservation_id: str):
+        """Get a single reservation by ID."""
+        svc = get_service()
+        rsv = svc.get_reservation(reservation_id)
+        if rsv is None:
+            from fastapi import HTTPException
+            raise HTTPException(status_code=404, detail=f"Reservation {reservation_id} not found")
+        return rsv.model_dump(mode="json")
+
     return app
 
 

@@ -23,6 +23,7 @@ from .models import (
     WebhookEvent,
     ProjectionIntegration,
     ThrottleTier, DEFAULT_THROTTLE_TIERS,
+    SpendReservation, ReservationStatus,
 )
 
 from .store import BudgetStore
@@ -1978,8 +1979,16 @@ class BudgetService:
         scope_id: Optional[str],
         period_start: datetime,
         now: datetime,
+        include_reservations: bool = False,
     ) -> float:
-        """Get total LLM spend for a scope in a time period."""
+        """Get total LLM spend for a scope in a time period.
+
+        When ``include_reservations`` is True (v0.9.0), active spend
+        reservations are added to the settled spend total.  This gives
+        guardrail checks a view of *committed* spend, preventing the
+        parallel-agent race where N calls all read the same under-limit
+        total and fire past the ceiling.
+        """
         records = self.store.list_llm_usage(from_date=period_start.date())
         total = 0.0
         for r in records:
@@ -2004,6 +2013,39 @@ class BudgetService:
             elif scope == GuardrailScope.BUDGET and scope_id:
                 if r.metadata.get("budget_id", "").lower() == scope_id.lower():
                     total += r.cost_usd
+
+        if include_reservations:
+            total += self._reserved_spend_for_scope(scope, scope_id, now)
+        return total
+
+    def _reserved_spend_for_scope(
+        self,
+        scope: GuardrailScope,
+        scope_id: Optional[str],
+        now: datetime,
+    ) -> float:
+        """Sum the reserved amounts of all ACTIVE reservations matching this scope.
+
+        Global scope counts all active reservations; scoped checks match on
+        the reservation's agent_id / model_id / task_id / budget_id field.
+        """
+        reservations = self.store.list_reservations(active_only=True, now=now)
+        total = 0.0
+        for rsv in reservations:
+            if scope == GuardrailScope.GLOBAL:
+                total += rsv.reserved_amount_usd
+            elif scope == GuardrailScope.AGENT and scope_id:
+                if rsv.agent_id and rsv.agent_id.lower() == scope_id.lower():
+                    total += rsv.reserved_amount_usd
+            elif scope == GuardrailScope.MODEL and scope_id:
+                if rsv.model_id and rsv.model_id.lower() == scope_id.lower():
+                    total += rsv.reserved_amount_usd
+            elif scope == GuardrailScope.TASK and scope_id:
+                if rsv.task_id and rsv.task_id.lower() == scope_id.lower():
+                    total += rsv.reserved_amount_usd
+            elif scope == GuardrailScope.BUDGET and scope_id:
+                if rsv.budget_id and rsv.budget_id.lower() == scope_id.lower():
+                    total += rsv.reserved_amount_usd
         return total
 
     def _get_active_cooldown(
@@ -3232,3 +3274,405 @@ class BudgetService:
             pass
 
         return decision
+
+    # ------------------------------------------------------------------ #
+    # v0.9.0 — Concurrency-safe reserve/settle protocol
+    # ------------------------------------------------------------------ #
+    #
+    # The race: ``check_guardrails`` reads settled spend, the agent makes the
+    # call, then ``record`` writes the cost.  Between read and write, N
+    # concurrent agents can all observe the same under-limit total and all
+    # fire — blowing past the ceiling.  This is the exact bug floe-guard
+    # markets against.
+    #
+    # The fix: ``reserve_and_check`` runs the guardrail check under the
+    # store lock with ``include_reservations=True`` and, if the call is
+    # allowed, *immediately* creates an ACTIVE reservation before releasing
+    # the lock.  Subsequent concurrent calls now see the reserved amount
+    # counted against the budget.  After the real call completes, the agent
+    # calls ``settle_reservation`` to record actual usage and close the
+    # reservation, or ``release_reservation`` to return the budget if the
+    # call never happened.
+
+    def reserve_and_check(
+        self,
+        estimated_cost_usd: float = 0.0,
+        agent_id: Optional[str] = None,
+        model_id: Optional[str] = None,
+        budget_id: Optional[str] = None,
+        task_id: Optional[str] = None,
+        ttl_minutes: int = 5,
+        now: Optional[datetime] = None,
+    ) -> tuple[GuardrailDecision, Optional[SpendReservation]]:
+        """Atomically check guardrails *and* reserve the estimated cost.
+
+        This is the concurrency-safe replacement for the check → call →
+        record pattern.  Under the store lock it:
+
+        1. Expires stale reservations (cleanup)
+        2. Runs ``check_guardrails`` with ``include_reservations=True``
+           so committed spend is counted
+        3. If the decision is ALLOW/WARN (call proceeds), creates an
+           ACTIVE reservation for ``estimated_cost_usd``
+
+        Returns ``(decision, reservation)``.  If the call was blocked the
+        reservation is ``None``.  The caller MUST later call
+        ``settle_reservation`` (with actual usage) or
+        ``release_reservation`` (if the call was abandoned).
+
+        Args:
+            estimated_cost_usd: Best-guess cost of the upcoming call
+            agent_id: Agent making the call
+            model_id: Model being called
+            budget_id: Associated budget
+            task_id: Task/session ID
+            ttl_minutes: How long the reservation holds before auto-expiry
+            now: Override current time (testing)
+        """
+        now = now or datetime.now(timezone.utc)
+
+        with self.store._lock:
+            # 1. Reap expired reservations so their budget is released
+            self.store.expire_stale_reservations(now=now)
+
+            # 2. Run the guardrail check counting committed (reserved) spend.
+            #    We call the check logic directly but need the reservation-aware
+            #    spend path.  check_guardrails uses _get_spend_for_period which
+            #    now accepts include_reservations; we temporarily monkey-patch
+            #    by wrapping.  Simpler: re-run with a reservation-aware variant.
+            decision = self._check_guardrails_internal(
+                estimated_cost_usd=estimated_cost_usd,
+                agent_id=agent_id,
+                model_id=model_id,
+                budget_id=budget_id,
+                task_id=task_id,
+                now=now,
+                include_reservations=True,
+            )
+
+            # 3. Reserve if the call is allowed to proceed
+            if decision.allowed and estimated_cost_usd >= 0:
+                reservation = SpendReservation(
+                    reserved_amount_usd=estimated_cost_usd,
+                    agent_id=agent_id,
+                    model_id=model_id,
+                    task_id=task_id,
+                    budget_id=budget_id,
+                    status=ReservationStatus.ACTIVE,
+                    expires_at=now + timedelta(minutes=max(1, ttl_minutes)),
+                    metadata={"guardrail_id": decision.guardrail_id} if decision.guardrail_id else {},
+                )
+                self.store.save_reservation(reservation)
+                return decision, reservation
+
+            return decision, None
+
+    def _check_guardrails_internal(
+        self,
+        estimated_cost_usd: float = 0.0,
+        agent_id: Optional[str] = None,
+        model_id: Optional[str] = None,
+        budget_id: Optional[str] = None,
+        task_id: Optional[str] = None,
+        now: Optional[datetime] = None,
+        include_reservations: bool = False,
+    ) -> GuardrailDecision:
+        """Internal guardrail check that optionally counts reserved spend.
+
+        This mirrors ``check_guardrails`` but threads the
+        ``include_reservations`` flag through to ``_get_spend_for_period``
+        so that the reserve_and_check path sees committed spend.
+        """
+        now = now or datetime.now(timezone.utc)
+
+        # Kill switch
+        kill_switch = self.store.get_kill_switch()
+        if kill_switch.is_active(now):
+            return GuardrailDecision(
+                allowed=False,
+                action=GuardrailAction.KILL,
+                reason=f"KILL SWITCH ACTIVE: {kill_switch.reason}.",
+                current_spend_usd=0.0,
+            )
+
+        guardrails = self.store.list_guardrails(enabled_only=True)
+        if not guardrails:
+            return GuardrailDecision(
+                allowed=True,
+                action=GuardrailAction.ALLOW,
+                reason="No guardrails configured — all calls allowed",
+                current_spend_usd=0.0,
+            )
+
+        worst_decision: Optional[GuardrailDecision] = None
+
+        for g in guardrails:
+            applies = False
+            check_scope_id = None
+
+            if g.scope == GuardrailScope.GLOBAL:
+                applies = True
+            elif g.scope == GuardrailScope.AGENT and agent_id:
+                if g.scope_id is None or g.scope_id.lower() == agent_id.lower():
+                    applies = True
+                    check_scope_id = agent_id
+            elif g.scope == GuardrailScope.MODEL and model_id:
+                if g.scope_id is None or g.scope_id.lower() == model_id.lower():
+                    applies = True
+                    check_scope_id = model_id
+            elif g.scope == GuardrailScope.BUDGET and budget_id:
+                if g.scope_id is None or g.scope_id.lower() == budget_id.lower():
+                    applies = True
+                    check_scope_id = budget_id
+            elif g.scope == GuardrailScope.TASK and task_id:
+                if g.scope_id is None or g.scope_id.lower() == task_id.lower():
+                    applies = True
+                    check_scope_id = task_id
+
+            if not applies:
+                continue
+
+            # Per-call limit
+            if g.per_call_limit_usd is not None and estimated_cost_usd > g.per_call_limit_usd:
+                decision = GuardrailDecision(
+                    allowed=False,
+                    action=GuardrailAction.BLOCK,
+                    reason=f"Per-call cost ${estimated_cost_usd:.4f} exceeds limit ${g.per_call_limit_usd:.4f} (guardrail: {g.name})",
+                    guardrail_id=g.id,
+                    limit_usd=g.per_call_limit_usd,
+                    percent_used=100.0,
+                )
+                if worst_decision is None or decision.action.value > worst_decision.action.value:
+                    worst_decision = decision
+                continue
+
+            # Daily limit (reservation-aware)
+            if g.daily_limit_usd is not None:
+                day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+                daily_spend = self._get_spend_for_period(
+                    g.scope, check_scope_id, day_start, now,
+                    include_reservations=include_reservations,
+                )
+                projected = daily_spend + estimated_cost_usd
+                pct = (projected / g.daily_limit_usd * 100) if g.daily_limit_usd > 0 else 0
+
+                if pct >= g.block_at_percent:
+                    decision = GuardrailDecision(
+                        allowed=False,
+                        action=GuardrailAction.BLOCK,
+                        reason=f"Daily limit ${g.daily_limit_usd:.2f} reached — committed spend ${daily_spend:.2f}, projected ${projected:.2f} ({pct:.1f}%) (guardrail: {g.name})",
+                        guardrail_id=g.id,
+                        current_spend_usd=daily_spend,
+                        limit_usd=g.daily_limit_usd,
+                        percent_used=pct,
+                    )
+                    if worst_decision is None or decision.action.value > worst_decision.action.value:
+                        worst_decision = decision
+                    continue
+                elif g.throttle_enabled:
+                    throttle_decision = self._check_throttle_tier(
+                        g, estimated_cost_usd, pct, daily_spend, g.daily_limit_usd, "daily"
+                    )
+                    if throttle_decision:
+                        if worst_decision is None or (worst_decision.allowed and not throttle_decision.allowed):
+                            worst_decision = throttle_decision
+                        elif worst_decision and worst_decision.action == GuardrailAction.WARN and throttle_decision.action == GuardrailAction.THROTTLE:
+                            worst_decision = throttle_decision
+                        continue
+                elif pct >= g.warn_at_percent:
+                    decision = GuardrailDecision(
+                        allowed=True,
+                        action=GuardrailAction.WARN,
+                        reason=f"Approaching daily limit: {pct:.1f}% of ${g.daily_limit_usd:.2f} (committed ${daily_spend:.2f})",
+                        guardrail_id=g.id,
+                        current_spend_usd=daily_spend,
+                        limit_usd=g.daily_limit_usd,
+                        percent_used=pct,
+                    )
+                    if worst_decision is None or (worst_decision.allowed and not decision.allowed):
+                        worst_decision = decision
+                    continue
+
+            # Hourly limit (reservation-aware)
+            if g.hourly_limit_usd is not None:
+                hour_start = now - timedelta(hours=1)
+                hourly_spend = self._get_spend_for_period(
+                    g.scope, check_scope_id, hour_start, now,
+                    include_reservations=include_reservations,
+                )
+                projected = hourly_spend + estimated_cost_usd
+                pct = (projected / g.hourly_limit_usd * 100) if g.hourly_limit_usd > 0 else 0
+
+                if pct >= g.block_at_percent:
+                    decision = GuardrailDecision(
+                        allowed=False,
+                        action=GuardrailAction.BLOCK,
+                        reason=f"Hourly limit ${g.hourly_limit_usd:.2f} reached — committed ${hourly_spend:.2f}, projected ${projected:.2f} ({pct:.1f}%) (guardrail: {g.name})",
+                        guardrail_id=g.id,
+                        current_spend_usd=hourly_spend,
+                        limit_usd=g.hourly_limit_usd,
+                        percent_used=pct,
+                    )
+                    if worst_decision is None or decision.action.value > worst_decision.action.value:
+                        worst_decision = decision
+                    continue
+                elif pct >= g.warn_at_percent:
+                    decision = GuardrailDecision(
+                        allowed=True,
+                        action=GuardrailAction.WARN,
+                        reason=f"Approaching hourly limit: {pct:.1f}% of ${g.hourly_limit_usd:.2f}",
+                        guardrail_id=g.id,
+                        current_spend_usd=hourly_spend,
+                        limit_usd=g.hourly_limit_usd,
+                        percent_used=pct,
+                    )
+                    if worst_decision is None or (worst_decision.allowed and not decision.allowed):
+                        worst_decision = decision
+                    continue
+
+            # Monthly limit (reservation-aware)
+            if g.monthly_limit_usd is not None:
+                month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+                monthly_spend = self._get_spend_for_period(
+                    g.scope, check_scope_id, month_start, now,
+                    include_reservations=include_reservations,
+                )
+                projected = monthly_spend + estimated_cost_usd
+                pct = (projected / g.monthly_limit_usd * 100) if g.monthly_limit_usd > 0 else 0
+
+                if pct >= g.block_at_percent:
+                    decision = GuardrailDecision(
+                        allowed=False,
+                        action=GuardrailAction.BLOCK,
+                        reason=f"Monthly limit ${g.monthly_limit_usd:.2f} reached — committed ${monthly_spend:.2f}, projected ${projected:.2f} ({pct:.1f}%) (guardrail: {g.name})",
+                        guardrail_id=g.id,
+                        current_spend_usd=monthly_spend,
+                        limit_usd=g.monthly_limit_usd,
+                        percent_used=pct,
+                    )
+                    if worst_decision is None or decision.action.value > worst_decision.action.value:
+                        worst_decision = decision
+                    continue
+                elif pct >= g.warn_at_percent:
+                    decision = GuardrailDecision(
+                        allowed=True,
+                        action=GuardrailAction.WARN,
+                        reason=f"Approaching monthly limit: {pct:.1f}% of ${g.monthly_limit_usd:.2f}",
+                        guardrail_id=g.id,
+                        current_spend_usd=monthly_spend,
+                        limit_usd=g.monthly_limit_usd,
+                        percent_used=pct,
+                    )
+                    if worst_decision is None or (worst_decision.allowed and not decision.allowed):
+                        worst_decision = decision
+                    continue
+
+        return worst_decision or GuardrailDecision(
+            allowed=True,
+            action=GuardrailAction.ALLOW,
+            reason="All guardrails passed",
+            current_spend_usd=0.0,
+        )
+
+    def settle_reservation(
+        self,
+        reservation_id: str,
+        actual_cost_usd: float,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        model_id: Optional[str] = None,
+        now: Optional[datetime] = None,
+    ) -> SpendReservation:
+        """Settle a reservation with actual usage data.
+
+        Records the true cost as an ``LLMUsageRecord`` and closes the
+        reservation as SETTLED.  If the actual cost exceeds the reserved
+        estimate, the difference is still recorded (the budget took the
+        hit at reserve time; settle just makes the books accurate).
+
+        Raises ``ValueError`` if the reservation doesn't exist or isn't
+        in a settlable state.
+        """
+        now = now or datetime.now(timezone.utc)
+        rsv = self.store.get_reservation(reservation_id)
+        if rsv is None:
+            raise ValueError(f"Reservation {reservation_id} not found")
+
+        if rsv.status not in (ReservationStatus.ACTIVE, ReservationStatus.EXPIRED):
+            raise ValueError(
+                f"Reservation {reservation_id} is {rsv.status.value} — cannot settle"
+            )
+
+        # Record actual usage
+        from .llm_costs import LLMUsageRecord
+        record = LLMUsageRecord(
+            model_id=model_id or rsv.model_id or "unknown",
+            agent_id=rsv.agent_id,
+            task_id=rsv.task_id,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cost_usd=actual_cost_usd,
+            metadata={
+                **(rsv.metadata or {}),
+                "reservation_id": rsv.id,
+                "reserved_amount_usd": rsv.reserved_amount_usd,
+                "budget_id": rsv.budget_id,
+            } if rsv.budget_id else {
+                **(rsv.metadata or {}),
+                "reservation_id": rsv.id,
+                "reserved_amount_usd": rsv.reserved_amount_usd,
+            },
+        )
+        self.store.save_llm_usage(record)
+
+        # Close the reservation
+        updated = rsv.model_copy(update={
+            "status": ReservationStatus.SETTLED,
+            "settled_at": now,
+            "settled_amount_usd": actual_cost_usd,
+            "usage_record_id": record.id,
+        })
+        self.store.save_reservation(updated)
+        return updated
+
+    def release_reservation(
+        self,
+        reservation_id: str,
+        reason: str = "released",
+        now: Optional[datetime] = None,
+    ) -> SpendReservation:
+        """Release a reservation without settling (call never made / failed).
+
+        The reserved budget is returned to the pool immediately.
+        """
+        now = now or datetime.now(timezone.utc)
+        rsv = self.store.get_reservation(reservation_id)
+        if rsv is None:
+            raise ValueError(f"Reservation {reservation_id} not found")
+        if rsv.status != ReservationStatus.ACTIVE:
+            raise ValueError(
+                f"Reservation {reservation_id} is {rsv.status.value} — cannot release"
+            )
+        updated = rsv.model_copy(update={
+            "status": ReservationStatus.RELEASED,
+            "settled_at": now,
+            "metadata": {**(rsv.metadata or {}), "release_reason": reason},
+        })
+        self.store.save_reservation(updated)
+        return updated
+
+    def list_reservations(
+        self,
+        status: Optional[ReservationStatus] = None,
+        agent_id: Optional[str] = None,
+        active_only: bool = False,
+        now: Optional[datetime] = None,
+    ) -> list[SpendReservation]:
+        """List spend reservations."""
+        return self.store.list_reservations(
+            status=status, agent_id=agent_id, active_only=active_only, now=now,
+        )
+
+    def get_reservation(self, reservation_id: str) -> Optional[SpendReservation]:
+        """Fetch a single reservation."""
+        return self.store.get_reservation(reservation_id)

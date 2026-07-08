@@ -1769,6 +1769,143 @@ def check_guardrails_smart(
     return json.dumps(decision.model_dump(), default=str, indent=2)
 
 
+# === v0.9.0 Concurrency-safe reserve/settle protocol ===
+
+@mcp.tool()
+def reserve_and_check(
+    estimated_cost_usd: float = 0.0,
+    agent_id: str | None = None,
+    model_id: str | None = None,
+    budget_id: str | None = None,
+    task_id: str | None = None,
+    ttl_minutes: int = 5,
+) -> str:
+    """Atomically check guardrails AND reserve budget for an in-flight LLM call.
+
+    This is the CONCURRENCY-SAFE replacement for check_cost_guardrail when
+    multiple agents run in parallel. It prevents the race condition where N
+    concurrent agents all read the same under-limit spend and all fire past
+    the ceiling.
+
+    Workflow:
+      1. Call this BEFORE your LLM call — it checks limits AND reserves
+         the estimated cost atomically.
+      2. If allowed, make your LLM call.
+      3. After the call, call settle_reservation with the actual cost.
+      4. If you decide NOT to make the call, call release_reservation to
+         return the budget.
+
+    Args:
+        estimated_cost_usd: Best-guess cost of the upcoming call
+        agent_id: Agent making the call
+        model_id: Model being called
+        budget_id: Associated budget
+        task_id: Task/session ID
+        ttl_minutes: Reservation auto-expires after this many minutes
+
+    Returns:
+        JSON with the guardrail decision and reservation details.
+        If the call was blocked, reservation_id will be null.
+    """
+    svc = get_service()
+    decision, reservation = svc.reserve_and_check(
+        estimated_cost_usd=estimated_cost_usd,
+        agent_id=agent_id,
+        model_id=model_id,
+        budget_id=budget_id,
+        task_id=task_id,
+        ttl_minutes=ttl_minutes,
+    )
+    result = {
+        "decision": decision.model_dump(),
+        "reservation_id": reservation.id if reservation else None,
+        "reservation": reservation.model_dump() if reservation else None,
+    }
+    return json.dumps(result, default=str, indent=2)
+
+
+@mcp.tool()
+def settle_reservation(
+    reservation_id: str,
+    actual_cost_usd: float,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    model_id: str | None = None,
+) -> str:
+    """Settle a reservation with actual usage data after an LLM call completes.
+
+    Records the true cost and closes the reservation. The reserved budget
+    is replaced by the actual cost in spend calculations.
+
+    Args:
+        reservation_id: ID returned by reserve_and_check
+        actual_cost_usd: Real cost of the completed call
+        input_tokens: Prompt tokens used
+        output_tokens: Completion tokens used
+        model_id: Override the model ID if different from reservation
+    """
+    svc = get_service()
+    try:
+        settled = svc.settle_reservation(
+            reservation_id=reservation_id,
+            actual_cost_usd=actual_cost_usd,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            model_id=model_id,
+        )
+        return json.dumps(settled.model_dump(), default=str, indent=2)
+    except ValueError as e:
+        return json.dumps({"error": str(e)}, indent=2)
+
+
+@mcp.tool()
+def release_reservation(
+    reservation_id: str,
+    reason: str = "released",
+) -> str:
+    """Release a reservation without settling (call never made or failed).
+
+    Returns the reserved budget to the pool immediately.
+
+    Args:
+        reservation_id: ID returned by reserve_and_check
+        reason: Why the reservation is being released
+    """
+    svc = get_service()
+    try:
+        released = svc.release_reservation(
+            reservation_id=reservation_id,
+            reason=reason,
+        )
+        return json.dumps(released.model_dump(), default=str, indent=2)
+    except ValueError as e:
+        return json.dumps({"error": str(e)}, indent=2)
+
+
+@mcp.tool()
+def list_reservations(
+    status: str | None = None,
+    agent_id: str | None = None,
+    active_only: bool = False,
+) -> str:
+    """List spend reservations.
+
+    Args:
+        status: Filter by status (active, settled, released, expired)
+        agent_id: Filter by agent
+        active_only: Only show reservations that count against budget
+    """
+    from agent_budget.models import ReservationStatus
+    svc = get_service()
+    status_enum = ReservationStatus(status) if status else None
+    reservations = svc.list_reservations(
+        status=status_enum, agent_id=agent_id, active_only=active_only,
+    )
+    return json.dumps(
+        [r.model_dump() for r in reservations], default=str, indent=2,
+    )
+
+
 def run_server():
     """Run the MCP server."""
     mcp.run()

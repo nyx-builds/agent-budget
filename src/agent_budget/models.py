@@ -558,6 +558,56 @@ class CostAlertEvent(BaseModel):
     acknowledged: bool = Field(default=False)
 
 
+# v0.9.0 — Concurrency-safe reserve/settle protocol
+
+class ReservationStatus(str, Enum):
+    """Lifecycle states for a spend reservation."""
+    ACTIVE = "active"        # reserved, call in flight
+    SETTLED = "settled"      # actual cost recorded, reservation closed
+    RELEASED = "released"    # cancelled without settling (call never made / failed)
+    EXPIRED = "expired"      # TTL elapsed without settle/release
+
+
+class SpendReservation(BaseModel):
+    """A reservation of budget for an in-flight LLM call.
+
+    Solves the parallel-agent race condition: without reservations, N concurrent
+    agents can all read the same under-limit spend total and all fire past the
+    ceiling.  ``reserve()`` atomically subtracts the estimated cost from the
+    available budget *before* the call runs, so concurrent reservations see a
+    monotonically-decreasing pool.  ``settle()`` replaces the estimate with the
+    true cost; ``release()`` returns the budget if the call never happened.
+
+    Active reservations are included in spend calculations so guardrail checks
+    see committed spend, not just settled spend.
+    """
+    id: str = Field(default_factory=lambda: f"RSV-{uuid.uuid4().hex[:10].upper()}")
+    reserved_amount_usd: float = Field(ge=0, description="Estimated cost reserved against the budget")
+    agent_id: Optional[str] = Field(default=None, description="Agent that holds this reservation")
+    model_id: Optional[str] = Field(default=None, description="Model the call targets")
+    task_id: Optional[str] = Field(default=None, description="Task/session the call belongs to")
+    budget_id: Optional[str] = Field(default=None, description="Budget this reservation counts against")
+    status: ReservationStatus = Field(default=ReservationStatus.ACTIVE)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    expires_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc) + timedelta(minutes=5),
+        description="When the reservation auto-expires if not settled",
+    )
+    settled_at: Optional[datetime] = Field(default=None, description="When the reservation was settled")
+    settled_amount_usd: Optional[float] = Field(default=None, ge=0, description="Actual cost recorded at settle time")
+    usage_record_id: Optional[str] = Field(default=None, description="Linked LLMUsageRecord ID after settle")
+    metadata: dict = Field(default_factory=dict)
+
+    def is_active(self, now: Optional[datetime] = None) -> bool:
+        """True if the reservation still counts against the budget."""
+        if self.status != ReservationStatus.ACTIVE:
+            return False
+        now = now or datetime.now(timezone.utc)
+        if now > self.expires_at:
+            return False
+        return True
+
+
 # --- v0.6.0 Spend Projection & Loop Detection Models ---
 
 
