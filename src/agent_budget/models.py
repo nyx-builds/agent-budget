@@ -1098,5 +1098,146 @@ BUILTIN_BUDGET_TEMPLATES: list[BudgetTemplate] = [
     ),
 ]
 
+# v0.10.0 — Spend Anomaly Detection
+
+class AnomalyType(str, Enum):
+    """The kind of spending anomaly detected."""
+    SPIKE = "spike"             # single call or short window cost far above baseline
+    SUSTAINED_DRIFT = "sustained_drift"  # rolling avg steadily climbing
+    RATE_BURST = "rate_burst"  # calls-per-minute suddenly spikes
+    COST_PER_CALL = "cost_per_call"  # individual call far more expensive than typical
+    NEW_AGENT = "new_agent"    # spending from agent never seen before
+    NEW_MODEL = "new_model"    # spending on model never seen before
+    AFTER_HOURS = "after_hours"  # spending at unusual times
+
+
+class AnomalySeverity(str, Enum):
+    """How serious an anomaly is."""
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    CRITICAL = "critical"
+
+
+class AnomalyAction(str, Enum):
+    """What the system should do when an anomaly is detected."""
+    LOG = "log"                # record only, no intervention
+    NOTIFY = "notify"          # fire webhooks
+    THROTTLE = "throttle"      # recommend cost reduction
+    BLOCK = "block"            # hard block subsequent calls
+    KILL_SWITCH = "kill_switch"  # trigger the kill switch
+
+
+class SpendAnomalyRule(BaseModel):
+    """A rule defining what constitutes a spend anomaly.
+
+    Anomaly detection runs on top of the LLM usage data. Each rule watches
+    a scope (global, agent, model, task) and fires when the observed metric
+    deviates from the historical baseline beyond ``threshold``.
+
+    Detection methods (``method``):
+      - zscore:        flags when current value is > threshold stddevs above mean
+      - multiplier:    flags when current value is > threshold × the baseline mean
+      - absolute:      flags when the metric exceeds an absolute threshold
+      - rate:          flags when calls/min exceeds threshold
+    """
+    id: str = Field(default_factory=lambda: f"ANR-{uuid.uuid4().hex[:8].upper()}")
+    name: str = Field(min_length=1, description="Human-readable rule name")
+    enabled: bool = Field(default=True)
+    # What to watch
+    anomaly_type: AnomalyType = Field(description="Type of anomaly to detect")
+    method: str = Field(default="zscore", description="Detection method: zscore|multiplier|absolute|rate")
+    # Baseline: how many historical periods to average for the "normal" value
+    baseline_window_hours: int = Field(default=24, ge=1, description="Hours of history to compute baseline from")
+    # The trigger threshold (meaning depends on method)
+    threshold: float = Field(default=3.0, description="Stddevs (zscore) or × multiplier or absolute USD or calls/min")
+    # Optional minimum baseline size — don't trigger until N data points exist
+    min_samples: int = Field(default=5, ge=1, description="Minimum historical data points before detection activates")
+    # Scope filter
+    scope: GuardrailScope = Field(default=GuardrailScope.GLOBAL)
+    scope_id: Optional[str] = Field(default=None, description="Agent ID / model ID / task ID (None = all)")
+    # Optional time-of-day filter for after-hours detection
+    after_hours_start: Optional[int] = Field(default=None, ge=0, le=23, description="Hour (0-23 UTC) after which spending is anomalous")
+    after_hours_end: Optional[int] = Field(default=None, ge=0, le=23, description="Hour (0-23 UTC) before which spending is anomalous")
+    # Action on detection
+    action: AnomalyAction = Field(default=AnomalyAction.LOG)
+    # Cooldown: don't re-fire for same scope within N minutes
+    cooldown_minutes: int = Field(default=30, ge=0, description="Minimum minutes between detections of same anomaly")
+    # Auto-severity thresholds (multiplier of threshold)
+    severity_medium_multiplier: float = Field(default=1.5, description="Anomaly at threshold × this → medium severity")
+    severity_high_multiplier: float = Field(default=2.0, description="Anomaly at threshold × this → high severity")
+    severity_critical_multiplier: float = Field(default=3.0, description="Anomaly at threshold × this → critical severity")
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class AnomalyEvent(BaseModel):
+    """A detected spend anomaly event.
+
+    Created when an anomaly rule fires. Contains the details of what was
+    detected, the baseline it was compared against, and what action was taken.
+    """
+    id: str = Field(default_factory=lambda: f"ANM-{uuid.uuid4().hex[:8].upper()}")
+    rule_id: str = Field(description="Rule that triggered this event")
+    rule_name: str = Field(default="", description="Rule name at time of detection")
+    anomaly_type: AnomalyType = Field(description="Type of anomaly detected")
+    severity: AnomalySeverity = Field(default=AnomalySeverity.MEDIUM)
+    # What was observed
+    scope: GuardrailScope = Field(default=GuardrailScope.GLOBAL)
+    scope_id: Optional[str] = Field(default=None)
+    observed_value: float = Field(description="The metric value that triggered the anomaly")
+    baseline_mean: float = Field(default=0.0, description="Historical average at time of detection")
+    baseline_stddev: float = Field(default=0.0, description="Historical stddev at time of detection")
+    deviation_score: float = Field(default=0.0, description="How many stddevs or × multiplier above baseline")
+    # Detection window
+    window_minutes: int = Field(default=0, description="Time window of the anomaly observation")
+    sample_count: int = Field(default=0, description="Number of data points in baseline")
+    # Cost impact
+    anomaly_cost_usd: float = Field(default=0.0, description="Cost of the anomalous spending")
+    # Action taken
+    action_taken: AnomalyAction = Field(default=AnomalyAction.LOG)
+    action_result: str = Field(default="", description="What happened when the action fired (e.g., 'blocked', 'webhook sent')")
+    webhooks_fired: int = Field(default=0)
+    # Resolution
+    acknowledged: bool = Field(default=False)
+    acknowledged_by: Optional[str] = Field(default=None)
+    acknowledged_at: Optional[datetime] = Field(default=None)
+    resolved: bool = Field(default=False)
+    resolved_at: Optional[datetime] = Field(default=None)
+    # Context
+    message: str = Field(default="", description="Human-readable description of the anomaly")
+    metadata: dict = Field(default_factory=dict, description="Extra context (model_id, agent_id, sample records, etc.)")
+    detected_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+    def compute_severity(
+        self,
+        threshold: float,
+        medium_mult: float = 1.5,
+        high_mult: float = 2.0,
+        critical_mult: float = 3.0,
+    ) -> AnomalySeverity:
+        """Determine severity based on deviation score relative to threshold."""
+        if self.deviation_score >= threshold * critical_mult:
+            return AnomalySeverity.CRITICAL
+        if self.deviation_score >= threshold * high_mult:
+            return AnomalySeverity.HIGH
+        if self.deviation_score >= threshold * medium_mult:
+            return AnomalySeverity.MEDIUM
+        return AnomalySeverity.LOW
+
+
+class AnomalySummary(BaseModel):
+    """Summary of anomaly detection status."""
+    total_rules: int = 0
+    active_rules: int = 0
+    total_events: int = 0
+    unacknowledged_events: int = 0
+    unresolved_events: int = 0
+    events_by_severity: dict[str, int] = Field(default_factory=dict)
+    events_by_type: dict[str, int] = Field(default_factory=dict)
+    recent_events: list[AnomalyEvent] = Field(default_factory=list, description="Most recent N events")
+    total_anomaly_cost_usd: float = Field(default=0.0, description="Total cost flagged as anomalous")
+
+
 # Rebuild models to resolve forward references
 GuardrailDecision.model_rebuild()

@@ -1906,6 +1906,176 @@ def list_reservations(
     )
 
 
+# --- v0.10.0: Spend Anomaly Detection Tools ---
+
+@mcp.tool()
+def create_anomaly_rule(
+    name: str,
+    anomaly_type: str,
+    method: str = "zscore",
+    threshold: float = 3.0,
+    baseline_window_hours: int = 24,
+    min_samples: int = 5,
+    scope: str = "global",
+    scope_id: str | None = None,
+    action: str = "log",
+    cooldown_minutes: int = 30,
+) -> str:
+    """Create a spend anomaly detection rule.
+
+    Anomaly detection monitors LLM usage patterns and flags unusual spending
+    that guardrails (which check absolute limits) would miss — e.g., a sudden
+    cost spike, a new agent, a burst of calls, or cost drift over time.
+
+    Args:
+        name: Human-readable rule name (e.g., 'Global cost spike detector')
+        anomaly_type: Type of anomaly (spike, sustained_drift, rate_burst,
+                      cost_per_call, new_agent, new_model, after_hours)
+        method: Detection method (zscore, multiplier, absolute, rate)
+        threshold: Stddevs (zscore), × multiplier, absolute USD, or calls/min
+        baseline_window_hours: Hours of history for baseline computation
+        min_samples: Minimum historical data points before activation
+        scope: global, agent, model, budget, task
+        scope_id: ID for scoped rules (agent_id, model_id, etc.)
+        action: What to do on detection (log, notify, throttle, block, kill_switch)
+        cooldown_minutes: Minutes between re-firing same rule
+    """
+    from agent_budget.models import AnomalyType, AnomalyAction
+    svc = get_service()
+    rule = svc.create_anomaly_rule(
+        name=name,
+        anomaly_type=AnomalyType(anomaly_type),
+        method=method,
+        threshold=threshold,
+        baseline_window_hours=baseline_window_hours,
+        min_samples=min_samples,
+        scope=GuardrailScope(scope),
+        scope_id=scope_id,
+        action=AnomalyAction(action),
+        cooldown_minutes=cooldown_minutes,
+    )
+    return json.dumps(rule.model_dump(), default=str, indent=2)
+
+
+@mcp.tool()
+def list_anomaly_rules(enabled_only: bool = False) -> str:
+    """List all anomaly detection rules.
+
+    Args:
+        enabled_only: Only show enabled rules
+    """
+    svc = get_service()
+    rules = svc.list_anomaly_rules(enabled_only=enabled_only)
+    return json.dumps([r.model_dump() for r in rules], default=str, indent=2)
+
+
+@mcp.tool()
+def detect_anomalies(
+    agent_id: str | None = None,
+    model_id: str | None = None,
+    cost_usd: float | None = None,
+    input_tokens: int | None = None,
+    output_tokens: int | None = None,
+) -> str:
+    """Run anomaly detection against all enabled rules.
+
+    Optionally pass context about a just-occurred call to enable per-call
+    anomaly types (cost_per_call, new_agent, new_model).
+
+    Args:
+        agent_id: Agent that just made a call (for per-call detection)
+        model_id: Model that was called
+        cost_usd: Cost of the just-completed call
+        input_tokens: Prompt tokens used
+        output_tokens: Completion tokens used
+    """
+    svc = get_service()
+    check_record = {}
+    if agent_id is not None:
+        check_record["agent_id"] = agent_id
+    if model_id is not None:
+        check_record["model_id"] = model_id
+    if cost_usd is not None:
+        check_record["cost_usd"] = cost_usd
+    if input_tokens is not None:
+        check_record["input_tokens"] = input_tokens
+    if output_tokens is not None:
+        check_record["output_tokens"] = output_tokens
+    events = svc.detect_anomalies(check_record=check_record or None)
+    return json.dumps(
+        [e.model_dump() for e in events], default=str, indent=2,
+    )
+
+
+@mcp.tool()
+def list_anomaly_events(
+    acknowledged: bool | None = None,
+    resolved: bool | None = None,
+    limit: int = 50,
+) -> str:
+    """List detected anomaly events.
+
+    Args:
+        acknowledged: Filter by acknowledged status
+        resolved: Filter by resolved status
+        limit: Maximum events to return
+    """
+    svc = get_service()
+    events = svc.list_anomaly_events(
+        acknowledged=acknowledged, resolved=resolved, limit=limit,
+    )
+    return json.dumps([e.model_dump() for e in events], default=str, indent=2)
+
+
+@mcp.tool()
+def acknowledge_anomaly(event_id: str, acknowledged_by: str | None = None) -> str:
+    """Acknowledge an anomaly event.
+
+    Args:
+        event_id: ID of the anomaly event
+        acknowledged_by: Who acknowledged it
+    """
+    svc = get_service()
+    event = svc.acknowledge_anomaly_event(event_id, acknowledged_by)
+    if not event:
+        return json.dumps({"error": f"Anomaly event {event_id} not found"}, indent=2)
+    return json.dumps(event.model_dump(), default=str, indent=2)
+
+
+@mcp.tool()
+def resolve_anomaly(event_id: str) -> str:
+    """Mark an anomaly event as resolved.
+
+    Args:
+        event_id: ID of the anomaly event
+    """
+    svc = get_service()
+    event = svc.resolve_anomaly_event(event_id)
+    if not event:
+        return json.dumps({"error": f"Anomaly event {event_id} not found"}, indent=2)
+    return json.dumps(event.model_dump(), default=str, indent=2)
+
+
+@mcp.tool()
+def get_anomaly_summary() -> str:
+    """Get a summary of anomaly detection status — rules, events, severity breakdown."""
+    svc = get_service()
+    summary = svc.get_anomaly_summary()
+    return json.dumps(summary.model_dump(), default=str, indent=2)
+
+
+@mcp.tool()
+def delete_anomaly_rule(rule_id: str) -> str:
+    """Delete an anomaly detection rule.
+
+    Args:
+        rule_id: ID of the rule to delete
+    """
+    svc = get_service()
+    deleted = svc.delete_anomaly_rule(rule_id)
+    return json.dumps({"deleted": deleted, "rule_id": rule_id}, indent=2)
+
+
 def run_server():
     """Run the MCP server."""
     mcp.run()

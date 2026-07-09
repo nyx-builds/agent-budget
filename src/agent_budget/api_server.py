@@ -108,6 +108,7 @@ from .models import (
     ExpenseStatus,
     SpendingRuleAction,
     SavingsGoalStatus,
+    GuardrailScope,
 )
 
 __version__ = "0.4.0"
@@ -1299,6 +1300,137 @@ def create_app() -> FastAPI:
             from fastapi import HTTPException
             raise HTTPException(status_code=404, detail=f"Reservation {reservation_id} not found")
         return rsv.model_dump(mode="json")
+
+    # --- v0.10.0: Spend Anomaly Detection ---
+
+    @app.post("/anomaly-rules")
+    def create_anomaly_rule(body: dict):
+        """Create a new anomaly detection rule."""
+        from fastapi import HTTPException
+        from agent_budget.models import AnomalyType, AnomalyAction
+        svc = get_service()
+        try:
+            rule = svc.create_anomaly_rule(
+                name=body["name"],
+                anomaly_type=AnomalyType(body.get("anomaly_type", "spike")),
+                method=body.get("method", "zscore"),
+                threshold=body.get("threshold", 3.0),
+                baseline_window_hours=body.get("baseline_window_hours", 24),
+                min_samples=body.get("min_samples", 5),
+                scope=GuardrailScope(body.get("scope", "global")),
+                scope_id=body.get("scope_id"),
+                action=AnomalyAction(body.get("action", "log")),
+                after_hours_start=body.get("after_hours_start"),
+                after_hours_end=body.get("after_hours_end"),
+                cooldown_minutes=body.get("cooldown_minutes", 30),
+            )
+            return rule.model_dump(mode="json")
+        except (ValueError, KeyError) as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    @app.get("/anomaly-rules")
+    def list_anomaly_rules(enabled_only: bool = False):
+        """List all anomaly detection rules."""
+        svc = get_service()
+        rules = svc.list_anomaly_rules(enabled_only=enabled_only)
+        return [r.model_dump(mode="json") for r in rules]
+
+    @app.get("/anomaly-rules/{rule_id}")
+    def get_anomaly_rule(rule_id: str):
+        """Get a single anomaly rule by ID."""
+        from fastapi import HTTPException
+        svc = get_service()
+        rule = svc.get_anomaly_rule(rule_id)
+        if rule is None:
+            raise HTTPException(status_code=404, detail=f"Rule {rule_id} not found")
+        return rule.model_dump(mode="json")
+
+    @app.patch("/anomaly-rules/{rule_id}")
+    def update_anomaly_rule(rule_id: str, body: dict):
+        """Update an anomaly rule."""
+        from fastapi import HTTPException
+        svc = get_service()
+        try:
+            rule = svc.update_anomaly_rule(rule_id, **body)
+            return rule.model_dump(mode="json")
+        except ValueError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+
+    @app.delete("/anomaly-rules/{rule_id}")
+    def delete_anomaly_rule(rule_id: str):
+        """Delete an anomaly rule."""
+        svc = get_service()
+        deleted = svc.delete_anomaly_rule(rule_id)
+        return {"deleted": deleted, "rule_id": rule_id}
+
+    @app.post("/anomaly-rules/detect")
+    def detect_anomalies(body: dict | None = None):
+        """Run anomaly detection against all enabled rules.
+
+        Optionally pass check_record in body for per-call detection.
+        """
+        svc = get_service()
+        check_record = (body or {}).get("check_record")
+        events = svc.detect_anomalies(check_record=check_record)
+        return [e.model_dump(mode="json") for e in events]
+
+    @app.get("/anomaly-events")
+    def list_anomaly_events(
+        acknowledged: Optional[bool] = None,
+        resolved: Optional[bool] = None,
+        limit: int = 50,
+    ):
+        """List detected anomaly events."""
+        svc = get_service()
+        events = svc.list_anomaly_events(
+            acknowledged=acknowledged, resolved=resolved, limit=limit,
+        )
+        return [e.model_dump(mode="json") for e in events]
+
+    @app.get("/anomaly-events/{event_id}")
+    def get_anomaly_event(event_id: str):
+        """Get a single anomaly event."""
+        from fastapi import HTTPException
+        svc = get_service()
+        event = svc.get_anomaly_event(event_id)
+        if event is None:
+            raise HTTPException(status_code=404, detail=f"Event {event_id} not found")
+        return event.model_dump(mode="json")
+
+    @app.post("/anomaly-events/{event_id}/acknowledge")
+    def acknowledge_anomaly(event_id: str, body: dict | None = None):
+        """Acknowledge an anomaly event."""
+        from fastapi import HTTPException
+        svc = get_service()
+        ack_by = (body or {}).get("acknowledged_by") if body else None
+        event = svc.acknowledge_anomaly_event(event_id, ack_by)
+        if event is None:
+            raise HTTPException(status_code=404, detail=f"Event {event_id} not found")
+        return event.model_dump(mode="json")
+
+    @app.post("/anomaly-events/{event_id}/resolve")
+    def resolve_anomaly(event_id: str):
+        """Resolve an anomaly event."""
+        from fastapi import HTTPException
+        svc = get_service()
+        event = svc.resolve_anomaly_event(event_id)
+        if event is None:
+            raise HTTPException(status_code=404, detail=f"Event {event_id} not found")
+        return event.model_dump(mode="json")
+
+    @app.get("/anomaly-summary")
+    def anomaly_summary():
+        """Get anomaly detection summary."""
+        svc = get_service()
+        summary = svc.get_anomaly_summary()
+        return summary.model_dump(mode="json")
+
+    @app.delete("/anomaly-events")
+    def clear_anomaly_events(rule_id: Optional[str] = None):
+        """Clear anomaly events."""
+        svc = get_service()
+        count = svc.clear_anomaly_events(rule_id=rule_id)
+        return {"cleared": count}
 
     return app
 

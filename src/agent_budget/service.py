@@ -24,6 +24,8 @@ from .models import (
     ProjectionIntegration,
     ThrottleTier, DEFAULT_THROTTLE_TIERS,
     SpendReservation, ReservationStatus,
+    SpendAnomalyRule, AnomalyEvent, AnomalyType, AnomalySeverity,
+    AnomalyAction, AnomalySummary,
 )
 
 from .store import BudgetStore
@@ -3676,3 +3678,550 @@ class BudgetService:
     def get_reservation(self, reservation_id: str) -> Optional[SpendReservation]:
         """Fetch a single reservation."""
         return self.store.get_reservation(reservation_id)
+
+    # ------------------------------------------------------------------ #
+    # v0.10.0 — Spend Anomaly Detection                                  #
+    # ------------------------------------------------------------------ #
+
+    def create_anomaly_rule(
+        self,
+        name: str,
+        anomaly_type: AnomalyType,
+        method: str = "zscore",
+        threshold: float = 3.0,
+        baseline_window_hours: int = 24,
+        min_samples: int = 5,
+        scope: GuardrailScope = GuardrailScope.GLOBAL,
+        scope_id: Optional[str] = None,
+        action: AnomalyAction = AnomalyAction.LOG,
+        after_hours_start: Optional[int] = None,
+        after_hours_end: Optional[int] = None,
+        cooldown_minutes: int = 30,
+        enabled: bool = True,
+    ) -> SpendAnomalyRule:
+        """Create a new anomaly detection rule."""
+        rule = SpendAnomalyRule(
+            name=name,
+            anomaly_type=anomaly_type,
+            method=method,
+            threshold=threshold,
+            baseline_window_hours=baseline_window_hours,
+            min_samples=min_samples,
+            scope=scope,
+            scope_id=scope_id,
+            action=action,
+            after_hours_start=after_hours_start,
+            after_hours_end=after_hours_end,
+            cooldown_minutes=cooldown_minutes,
+            enabled=enabled,
+        )
+        self.store.save_anomaly_rule(rule)
+        return rule
+
+    def update_anomaly_rule(self, rule_id: str, **kwargs) -> SpendAnomalyRule:
+        """Update an anomaly rule. Raises ValueError if not found."""
+        rule = self.store.get_anomaly_rule(rule_id)
+        if not rule:
+            raise ValueError(f"Anomaly rule {rule_id} not found")
+        updated = rule.model_copy(update=kwargs)
+        self.store.save_anomaly_rule(updated)
+        return updated
+
+    def list_anomaly_rules(self, enabled_only: bool = False) -> list[SpendAnomalyRule]:
+        return self.store.list_anomaly_rules(enabled_only=enabled_only)
+
+    def get_anomaly_rule(self, rule_id: str) -> Optional[SpendAnomalyRule]:
+        return self.store.get_anomaly_rule(rule_id)
+
+    def delete_anomaly_rule(self, rule_id: str) -> bool:
+        return self.store.delete_anomaly_rule(rule_id)
+
+    def _compute_baseline(
+        self,
+        records: list,
+        window_hours: int,
+        now: Optional[datetime] = None,
+    ) -> tuple[float, float, int]:
+        """Compute mean, stddev, and sample count from historical records.
+
+        Records should be LLMUsageRecord objects. Only records within the
+        baseline window (now - window_hours to now) are used.
+        """
+        now = now or datetime.now(timezone.utc)
+        cutoff = now - timedelta(hours=window_hours)
+        baseline_costs = [
+            r.cost_usd for r in records
+            if r.recorded_at >= cutoff and r.cost_usd > 0
+        ]
+        if not baseline_costs:
+            # Fall back to all records if no in-window data
+            baseline_costs = [r.cost_usd for r in records if r.cost_usd > 0]
+        if not baseline_costs:
+            return 0.0, 0.0, 0
+        mean = sum(baseline_costs) / len(baseline_costs)
+        if len(baseline_costs) > 1:
+            variance = sum((c - mean) ** 2 for c in baseline_costs) / (len(baseline_costs) - 1)
+            stddev = variance ** 0.5
+        else:
+            stddev = 0.0
+        return mean, stddev, len(baseline_costs)
+
+    def _is_in_cooldown(
+        self,
+        rule_id: str,
+        cooldown_minutes: int,
+        now: Optional[datetime] = None,
+    ) -> bool:
+        """Check if this rule is still in cooldown (recently fired)."""
+        if cooldown_minutes <= 0:
+            return False
+        now = now or datetime.now(timezone.utc)
+        recent = self.store.list_anomaly_events(rule_id=rule_id, limit=1)
+        if not recent:
+            return False
+        last_event = recent[0]
+        if now - last_event.detected_at < timedelta(minutes=cooldown_minutes):
+            return True
+        return False
+
+    def detect_anomalies(
+        self,
+        now: Optional[datetime] = None,
+        check_record: Optional[dict] = None,
+    ) -> list[AnomalyEvent]:
+        """Run all enabled anomaly rules and return any events detected.
+
+        Args:
+            now: Reference timestamp (defaults to utcnow).
+            check_record: Optional context for a just-occurred call
+                         (e.g. {"agent_id": ..., "model_id": ..., "cost_usd": ...,
+                                "input_tokens": ..., "output_tokens": ...}).
+                         When provided, detection focuses on this record.
+
+        Returns:
+            List of AnomalyEvent objects created (empty if none detected).
+        """
+        now = now or datetime.now(timezone.utc)
+        rules = self.store.list_anomaly_rules(enabled_only=True)
+        events: list[AnomalyEvent] = []
+
+        for rule in rules:
+            if self._is_in_cooldown(rule.id, rule.cooldown_minutes, now):
+                continue
+
+            # Get relevant usage records
+            all_records = self.store.list_llm_usage(limit=500)
+
+            # Filter by scope
+            scoped_records = self._filter_records_by_scope(all_records, rule, check_record)
+            if len(scoped_records) < rule.min_samples:
+                continue
+
+            event = self._evaluate_rule(rule, scoped_records, now, check_record)
+            if event:
+                events.append(event)
+                self.store.save_anomaly_event(event)
+                self._execute_anomaly_action(rule, event, now)
+
+        return events
+
+    def _filter_records_by_scope(
+        self,
+        records: list,
+        rule: SpendAnomalyRule,
+        check_record: Optional[dict] = None,
+    ) -> list:
+        """Filter usage records by the rule's scope."""
+        if rule.scope == GuardrailScope.GLOBAL:
+            return records
+        result = []
+        for r in records:
+            if rule.scope == GuardrailScope.AGENT and rule.scope_id:
+                if r.agent_id and r.agent_id.lower() == rule.scope_id.lower():
+                    result.append(r)
+            elif rule.scope == GuardrailScope.MODEL and rule.scope_id:
+                if r.model_id and r.model_id.lower() == rule.scope_id.lower():
+                    result.append(r)
+            elif rule.scope == GuardrailScope.TASK and rule.scope_id:
+                if r.task_id and r.task_id.lower() == rule.scope_id.lower():
+                    result.append(r)
+            else:
+                result.append(r)
+        return result
+
+    def _evaluate_rule(
+        self,
+        rule: SpendAnomalyRule,
+        records: list,
+        now: datetime,
+        check_record: Optional[dict] = None,
+    ) -> Optional[AnomalyEvent]:
+        """Evaluate a single anomaly rule against records. Returns event if anomaly detected."""
+        mean, stddev, sample_count = self._compute_baseline(records, rule.baseline_window_hours, now)
+
+        # Handle after-hours detection
+        if rule.anomaly_type == AnomalyType.AFTER_HOURS:
+            if rule.after_hours_start is not None and rule.after_hours_end is not None:
+                hour = now.hour
+                start, end = rule.after_hours_start, rule.after_hours_end
+                in_window = hour >= start or hour < end if start > end else (start <= hour < end)
+                if not in_window:
+                    return None
+                recent_cost = sum(
+                    r.cost_usd for r in records
+                    if (now - r.recorded_at).total_seconds() < 3600
+                )
+                if recent_cost > 0:
+                    deviation = recent_cost / (mean + 0.001)
+                    if deviation >= 1.0:
+                        return self._build_event(
+                            rule, recent_cost, mean, stddev, deviation, 60,
+                            sample_count, recent_cost, now, check_record,
+                            message=f"After-hours spend detected: ${recent_cost:.4f} between {start}:00-{end}:00 UTC",
+                        )
+            return None
+
+        # Handle new agent / new model detection
+        if rule.anomaly_type == AnomalyType.NEW_AGENT:
+            if check_record and check_record.get("agent_id"):
+                known_agents = {r.agent_id for r in records if r.agent_id}
+                if check_record["agent_id"] not in known_agents:
+                    cost = check_record.get("cost_usd", 0.0)
+                    return self._build_event(
+                        rule, cost, 0.0, 0.0, 999.0, 0, sample_count,
+                        cost, now, check_record,
+                        message=f"New agent '{check_record['agent_id']}' spending detected (first call, ${cost:.4f})",
+                    )
+            return None
+
+        if rule.anomaly_type == AnomalyType.NEW_MODEL:
+            if check_record and check_record.get("model_id"):
+                known_models = {r.model_id for r in records if r.model_id}
+                if check_record["model_id"] not in known_models:
+                    cost = check_record.get("cost_usd", 0.0)
+                    return self._build_event(
+                        rule, cost, 0.0, 0.0, 999.0, 0, sample_count,
+                        cost, now, check_record,
+                        message=f"New model '{check_record['model_id']}' spending detected (first call, ${cost:.4f})",
+                    )
+            return None
+
+        # Handle rate burst (calls per minute)
+        if rule.anomaly_type == AnomalyType.RATE_BURST:
+            recent_window = timedelta(minutes=max(1, int(rule.threshold)) if rule.method == "rate" else 5)
+            recent_calls = [r for r in records if (now - r.recorded_at) < recent_window]
+            calls_per_min = len(recent_calls) / max(1, recent_window.total_seconds() / 60)
+            # Baseline: average calls per minute over baseline window
+            baseline_window = timedelta(hours=rule.baseline_window_hours)
+            baseline_calls = [r for r in records if (now - r.recorded_at) < baseline_window]
+            baseline_cpm = len(baseline_calls) / max(1, baseline_window.total_seconds() / 60)
+
+            if rule.method == "rate":
+                if calls_per_min >= rule.threshold:
+                    deviation = calls_per_min / max(0.001, baseline_cpm)
+                    return self._build_event(
+                        rule, calls_per_min, baseline_cpm, 0.0, deviation,
+                        int(recent_window.total_seconds() / 60), sample_count,
+                        sum(r.cost_usd for r in recent_calls), now, check_record,
+                        message=f"Rate burst: {calls_per_min:.1f} calls/min (baseline {baseline_cpm:.1f})",
+                    )
+            return None
+
+        # Handle cost-per-call anomaly
+        if rule.anomaly_type == AnomalyType.COST_PER_CALL:
+            if check_record and check_record.get("cost_usd") is not None:
+                call_cost = check_record["cost_usd"]
+                if rule.method == "absolute":
+                    if call_cost >= rule.threshold:
+                        deviation = call_cost / max(0.001, mean)
+                        return self._build_event(
+                            rule, call_cost, mean, stddev, deviation, 0,
+                            sample_count, call_cost, now, check_record,
+                            message=f"High-cost call: ${call_cost:.4f} (abs threshold ${rule.threshold:.4f})",
+                        )
+                elif rule.method == "zscore" and stddev > 0:
+                    z = (call_cost - mean) / stddev
+                    if z >= rule.threshold:
+                        return self._build_event(
+                            rule, call_cost, mean, stddev, z, 0,
+                            sample_count, call_cost, now, check_record,
+                            message=f"Cost-per-call anomaly: ${call_cost:.4f} is {z:.1f}σ above mean ${mean:.4f}",
+                        )
+                elif rule.method == "multiplier" and mean > 0:
+                    mult = call_cost / mean
+                    if mult >= rule.threshold:
+                        return self._build_event(
+                            rule, call_cost, mean, stddev, mult, 0,
+                            sample_count, call_cost, now, check_record,
+                            message=f"Cost-per-call anomaly: ${call_cost:.4f} is {mult:.1f}× the avg ${mean:.4f}",
+                        )
+            return None
+
+        # Handle spike and sustained drift (window-based cost anomalies)
+        # Get recent window costs
+        recent_window_minutes = max(1, rule.baseline_window_hours * 60 // 24)  # 1/24 of baseline
+        recent_cutoff = now - timedelta(minutes=recent_window_minutes)
+        recent_records = [r for r in records if r.recorded_at >= recent_cutoff]
+        recent_cost = sum(r.cost_usd for r in recent_records)
+
+        # For window-based anomalies, recompute baseline EXCLUDING the recent
+        # window so the anomaly itself doesn't contaminate the "normal" stats.
+        historical_records = [r for r in records if r.recorded_at < recent_cutoff]
+        if historical_records:
+            h_mean, h_stddev, h_count = self._compute_baseline(
+                historical_records, rule.baseline_window_hours, now
+            )
+            if h_count > 0:
+                mean, stddev, sample_count = h_mean, h_stddev, h_count
+
+        if rule.anomaly_type == AnomalyType.SPIKE:
+            if rule.method == "zscore":
+                if stddev > 0:
+                    z = (recent_cost - mean) / stddev
+                    if z >= rule.threshold:
+                        return self._build_event(
+                            rule, recent_cost, mean, stddev, z, recent_window_minutes,
+                            sample_count, recent_cost, now, check_record,
+                            message=f"Cost spike: ${recent_cost:.4f} in {recent_window_minutes}min ({z:.1f}σ above mean ${mean:.4f})",
+                        )
+                elif mean > 0 and recent_cost > mean:
+                    # When baseline is perfectly flat (stddev=0), any cost
+                    # above the mean is an infinitely-significant spike.
+                    z = (recent_cost - mean) / max(mean, 0.001)  # use mean as scale
+                    if z >= rule.threshold:
+                        return self._build_event(
+                            rule, recent_cost, mean, 0.0, z, recent_window_minutes,
+                            sample_count, recent_cost, now, check_record,
+                            message=f"Cost spike: ${recent_cost:.4f} in {recent_window_minutes}min ({z:.1f}× above flat baseline ${mean:.4f})",
+                        )
+            elif rule.method == "multiplier" and mean > 0:
+                mult = recent_cost / mean
+                if mult >= rule.threshold:
+                    return self._build_event(
+                        rule, recent_cost, mean, stddev, mult, recent_window_minutes,
+                        sample_count, recent_cost, now, check_record,
+                        message=f"Cost spike: ${recent_cost:.4f} is {mult:.1f}× the avg call cost ${mean:.4f}",
+                    )
+            elif rule.method == "absolute":
+                if recent_cost >= rule.threshold:
+                    deviation = recent_cost / max(0.001, mean)
+                    return self._build_event(
+                        rule, recent_cost, mean, stddev, deviation, recent_window_minutes,
+                        sample_count, recent_cost, now, check_record,
+                        message=f"Cost spike: ${recent_cost:.4f} exceeds absolute threshold ${rule.threshold:.4f}",
+                    )
+            return None
+
+        if rule.anomaly_type == AnomalyType.SUSTAINED_DRIFT:
+            # Compare rolling averages in two halves of the baseline window
+            half_hours = rule.baseline_window_hours / 2
+            half_cutoff = now - timedelta(hours=half_hours)
+            older = [r for r in records if r.recorded_at < half_cutoff]
+            newer = [r for r in records if r.recorded_at >= half_cutoff]
+            if len(older) >= rule.min_samples // 2 and len(newer) >= rule.min_samples // 2:
+                older_avg = sum(r.cost_usd for r in older) / len(older)
+                newer_avg = sum(r.cost_usd for r in newer) / len(newer)
+                if older_avg > 0:
+                    drift_ratio = newer_avg / older_avg
+                    if rule.method == "multiplier" and drift_ratio >= rule.threshold:
+                        return self._build_event(
+                            rule, newer_avg, older_avg, stddev, drift_ratio,
+                            rule.baseline_window_hours * 60, sample_count,
+                            newer_avg, now, check_record,
+                            message=f"Sustained drift: avg cost rose from ${older_avg:.4f} to ${newer_avg:.4f} ({drift_ratio:.1f}×)",
+                        )
+                    elif rule.method == "zscore" and stddev > 0:
+                        z = (newer_avg - mean) / stddev
+                        if z >= rule.threshold:
+                            return self._build_event(
+                                rule, newer_avg, mean, stddev, z,
+                                rule.baseline_window_hours * 60, sample_count,
+                                newer_avg, now, check_record,
+                                message=f"Sustained drift: avg cost ${newer_avg:.4f} is {z:.1f}σ above baseline ${mean:.4f}",
+                            )
+            return None
+
+        return None
+
+    def _build_event(
+        self,
+        rule: SpendAnomalyRule,
+        observed: float,
+        mean: float,
+        stddev: float,
+        deviation: float,
+        window_min: int,
+        sample_count: int,
+        cost: float,
+        now: datetime,
+        check_record: Optional[dict],
+        message: str,
+    ) -> AnomalyEvent:
+        """Build an AnomalyEvent from detection results."""
+        event = AnomalyEvent(
+            rule_id=rule.id,
+            rule_name=rule.name,
+            anomaly_type=rule.anomaly_type,
+            scope=rule.scope,
+            scope_id=rule.scope_id,
+            observed_value=observed,
+            baseline_mean=mean,
+            baseline_stddev=stddev,
+            deviation_score=deviation,
+            window_minutes=window_min,
+            sample_count=sample_count,
+            anomaly_cost_usd=cost,
+            action_taken=rule.action,
+            message=message,
+            detected_at=now,
+        )
+        event.severity = event.compute_severity(
+            rule.threshold,
+            rule.severity_medium_multiplier,
+            rule.severity_high_multiplier,
+            rule.severity_critical_multiplier,
+        )
+        if check_record:
+            event.metadata = {
+                k: v for k, v in check_record.items()
+                if k in ("agent_id", "model_id", "task_id", "cost_usd", "input_tokens", "output_tokens")
+            }
+        return event
+
+    def _execute_anomaly_action(
+        self,
+        rule: SpendAnomalyRule,
+        event: AnomalyEvent,
+        now: datetime,
+    ) -> str:
+        """Execute the action specified by the rule when an anomaly fires."""
+        result = ""
+        if rule.action == AnomalyAction.LOG:
+            result = "logged"
+        elif rule.action == AnomalyAction.NOTIFY:
+            # Fire anomaly webhook events
+            count = self._fire_anomaly_webhooks(event, now)
+            event.webhooks_fired = count
+            result = f"notified ({count} webhooks fired)"
+        elif rule.action == AnomalyAction.THROTTLE:
+            count = self._fire_anomaly_webhooks(event, now)
+            event.webhooks_fired = count
+            result = f"throttle recommended + {count} webhooks"
+        elif rule.action == AnomalyAction.BLOCK:
+            # For BLOCK, trigger cooldown on the relevant scope
+            count = self._fire_anomaly_webhooks(event, now)
+            event.webhooks_fired = count
+            result = f"block recommended + {count} webhooks"
+        elif rule.action == AnomalyAction.KILL_SWITCH:
+            try:
+                self.trigger_kill_switch(
+                    reason=f"Anomaly detected: {event.message}",
+                    triggered_by=f"anomaly_rule:{rule.id}",
+                )
+                result = "kill switch triggered"
+            except Exception:
+                result = "kill switch trigger failed"
+            count = self._fire_anomaly_webhooks(event, now)
+            event.webhooks_fired = count
+        event.action_result = result
+        self.store.save_anomaly_event(event)
+        return result
+
+    def _fire_anomaly_webhooks(self, event: AnomalyEvent, now: datetime) -> int:
+        """Fire webhooks for anomaly events. Returns count fired."""
+        payload = {
+            "event_type": "spend_anomaly",
+            "anomaly_id": event.id,
+            "anomaly_type": event.anomaly_type.value,
+            "severity": event.severity.value,
+            "rule_id": event.rule_id,
+            "rule_name": event.rule_name,
+            "observed_value": event.observed_value,
+            "baseline_mean": event.baseline_mean,
+            "deviation_score": event.deviation_score,
+            "anomaly_cost_usd": event.anomaly_cost_usd,
+            "message": event.message,
+            "detected_at": event.detected_at.isoformat(),
+        }
+        try:
+            return self._fire_webhooks(
+                WebhookEvent.GUARDRAIL_WARN, payload,
+                scope=event.scope, scope_id=event.scope_id,
+            )
+        except Exception:
+            return 0
+
+    def list_anomaly_events(
+        self,
+        rule_id: Optional[str] = None,
+        acknowledged: Optional[bool] = None,
+        resolved: Optional[bool] = None,
+        limit: Optional[int] = None,
+    ) -> list[AnomalyEvent]:
+        return self.store.list_anomaly_events(
+            rule_id=rule_id, acknowledged=acknowledged,
+            resolved=resolved, limit=limit,
+        )
+
+    def get_anomaly_event(self, event_id: str) -> Optional[AnomalyEvent]:
+        return self.store.get_anomaly_event(event_id)
+
+    def acknowledge_anomaly_event(
+        self, event_id: str, acknowledged_by: Optional[str] = None,
+    ) -> Optional[AnomalyEvent]:
+        event = self.store.get_anomaly_event(event_id)
+        if not event:
+            return None
+        updated = event.model_copy(update={
+            "acknowledged": True,
+            "acknowledged_by": acknowledged_by,
+            "acknowledged_at": datetime.now(timezone.utc),
+        })
+        self.store.save_anomaly_event(updated)
+        return updated
+
+    def resolve_anomaly_event(self, event_id: str) -> Optional[AnomalyEvent]:
+        event = self.store.get_anomaly_event(event_id)
+        if not event:
+            return None
+        updated = event.model_copy(update={
+            "resolved": True,
+            "resolved_at": datetime.now(timezone.utc),
+        })
+        self.store.save_anomaly_event(updated)
+        return updated
+
+    def delete_anomaly_event(self, event_id: str) -> bool:
+        return self.store.delete_anomaly_event(event_id)
+
+    def clear_anomaly_events(self, rule_id: Optional[str] = None) -> int:
+        return self.store.clear_anomaly_events(rule_id=rule_id)
+
+    def get_anomaly_summary(self, recent_limit: int = 20) -> AnomalySummary:
+        """Get a summary of anomaly detection status."""
+        all_rules = self.store.list_anomaly_rules()
+        all_events = self.store.list_anomaly_events()
+        unack = [e for e in all_events if not e.acknowledged]
+        unresolved = [e for e in all_events if not e.resolved]
+
+        by_severity: dict[str, int] = {}
+        by_type: dict[str, int] = {}
+        total_cost = 0.0
+        for e in all_events:
+            sev = e.severity.value
+            by_severity[sev] = by_severity.get(sev, 0) + 1
+            typ = e.anomaly_type.value
+            by_type[typ] = by_type.get(typ, 0) + 1
+            total_cost += e.anomaly_cost_usd
+
+        return AnomalySummary(
+            total_rules=len(all_rules),
+            active_rules=len([r for r in all_rules if r.enabled]),
+            total_events=len(all_events),
+            unacknowledged_events=len(unack),
+            unresolved_events=len(unresolved),
+            events_by_severity=by_severity,
+            events_by_type=by_type,
+            recent_events=all_events[:recent_limit],
+            total_anomaly_cost_usd=total_cost,
+        )

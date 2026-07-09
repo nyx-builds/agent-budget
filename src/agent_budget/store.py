@@ -16,6 +16,7 @@ from .models import (
     CostGuardrail, KillSwitch, CostAlertEvent,
     LoopDetectionConfig,
     SpendReservation, ReservationStatus,
+    SpendAnomalyRule, AnomalyEvent,
 )
 from .llm_costs import LLMUsageRecord, ModelPrice, ModelProvider
 
@@ -45,6 +46,8 @@ class BudgetStore:
         self._webhooks_file = self.data_dir / "webhooks.json"
         self._webhook_deliveries_file = self.data_dir / "webhook_deliveries.json"
         self._reservations_file = self.data_dir / "reservations.json"
+        self._anomaly_rules_file = self.data_dir / "anomaly_rules.json"
+        self._anomaly_events_file = self.data_dir / "anomaly_events.json"
         # v0.9.0: Process-wide lock so concurrent guardrail check+reserve
         # operations are atomic within a single Python process.  This is the
         # mechanism that makes the reserve/settle protocol hold under fan-out.
@@ -816,3 +819,115 @@ class BudgetStore:
             if changed:
                 self._write_json(self._reservations_file, [r.model_dump() for r in records])
         return expired_count
+
+    # --- v0.10.0: Spend Anomaly Detection ---
+
+    def list_anomaly_rules(self, enabled_only: bool = False) -> list[SpendAnomalyRule]:
+        """List all anomaly detection rules."""
+        with self._lock:
+            data = self._read_json(self._anomaly_rules_file)
+            rules = [SpendAnomalyRule(**d) for d in data]
+        if enabled_only:
+            rules = [r for r in rules if r.enabled]
+        rules.sort(key=lambda r: r.created_at)
+        return rules
+
+    def get_anomaly_rule(self, rule_id: str) -> Optional[SpendAnomalyRule]:
+        """Fetch a single anomaly rule by ID."""
+        for r in self.list_anomaly_rules():
+            if r.id == rule_id:
+                return r
+        return None
+
+    def save_anomaly_rule(self, rule: SpendAnomalyRule) -> SpendAnomalyRule:
+        """Create or update an anomaly rule."""
+        with self._lock:
+            rules = self.list_anomaly_rules()
+            found = False
+            for idx, r in enumerate(rules):
+                if r.id == rule.id:
+                    rules[idx] = rule
+                    found = True
+                    break
+            if not found:
+                rules.append(rule)
+            self._write_json(self._anomaly_rules_file, [r.model_dump() for r in rules])
+            return rule
+
+    def delete_anomaly_rule(self, rule_id: str) -> bool:
+        """Delete an anomaly rule by ID."""
+        with self._lock:
+            rules = self.list_anomaly_rules()
+            new_rules = [r for r in rules if r.id != rule_id]
+            if len(new_rules) == len(rules):
+                return False
+            self._write_json(self._anomaly_rules_file, [r.model_dump() for r in new_rules])
+            return True
+
+    def list_anomaly_events(
+        self,
+        rule_id: Optional[str] = None,
+        acknowledged: Optional[bool] = None,
+        resolved: Optional[bool] = None,
+        limit: Optional[int] = None,
+    ) -> list[AnomalyEvent]:
+        """List anomaly events with optional filters."""
+        with self._lock:
+            data = self._read_json(self._anomaly_events_file)
+            events = [AnomalyEvent(**d) for d in data]
+        if rule_id:
+            events = [e for e in events if e.rule_id == rule_id]
+        if acknowledged is not None:
+            events = [e for e in events if e.acknowledged == acknowledged]
+        if resolved is not None:
+            events = [e for e in events if e.resolved == resolved]
+        events.sort(key=lambda e: e.detected_at, reverse=True)
+        if limit:
+            events = events[:limit]
+        return events
+
+    def get_anomaly_event(self, event_id: str) -> Optional[AnomalyEvent]:
+        """Fetch a single anomaly event by ID."""
+        for e in self.list_anomaly_events():
+            if e.id == event_id:
+                return e
+        return None
+
+    def save_anomaly_event(self, event: AnomalyEvent) -> AnomalyEvent:
+        """Create or update an anomaly event."""
+        with self._lock:
+            events = self.list_anomaly_events()
+            found = False
+            for idx, e in enumerate(events):
+                if e.id == event.id:
+                    events[idx] = event
+                    found = True
+                    break
+            if not found:
+                events.append(event)
+            self._write_json(self._anomaly_events_file, [e.model_dump() for e in events])
+            return event
+
+    def delete_anomaly_event(self, event_id: str) -> bool:
+        """Delete an anomaly event by ID."""
+        with self._lock:
+            events = self.list_anomaly_events()
+            new_events = [e for e in events if e.id != event_id]
+            if len(new_events) == len(events):
+                return False
+            self._write_json(self._anomaly_events_file, [e.model_dump() for e in new_events])
+            return True
+
+    def clear_anomaly_events(self, rule_id: Optional[str] = None) -> int:
+        """Clear anomaly events, optionally filtered by rule. Returns count deleted."""
+        with self._lock:
+            events = self.list_anomaly_events()
+            if rule_id:
+                to_delete = [e for e in events if e.rule_id == rule_id]
+                to_keep = [e for e in events if e.rule_id != rule_id]
+            else:
+                to_delete = events
+                to_keep = []
+            count = len(to_delete)
+            self._write_json(self._anomaly_events_file, [e.model_dump() for e in to_keep])
+            return count
