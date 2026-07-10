@@ -16,6 +16,8 @@ from .models import (
 )
 from .service import BudgetService
 from .store import BudgetStore
+from .optimizer import ModelOptimizer, capability_tier
+from .llm_costs import ModelProvider
 
 mcp = FastMCP("agent-budget")
 
@@ -2074,6 +2076,183 @@ def delete_anomaly_rule(rule_id: str) -> str:
     svc = get_service()
     deleted = svc.delete_anomaly_rule(rule_id)
     return json.dumps({"deleted": deleted, "rule_id": rule_id}, indent=2)
+
+
+# ── Model Cost Optimizer tools (v0.11.0) ──────────────────────────────
+
+_optimizer: Optional[ModelOptimizer] = None
+
+
+def get_optimizer() -> ModelOptimizer:
+    global _optimizer
+    if _optimizer is None:
+        _optimizer = ModelOptimizer()
+    return _optimizer
+
+
+@mcp.tool()
+def compare_model_costs(
+    current_model: str,
+    input_tokens: int = 1000,
+    output_tokens: int = 500,
+    min_tier: str | None = None,
+    provider: str | None = None,
+) -> str:
+    """Compare the cost of *current_model* against all alternatives.
+
+    Returns a ranked list of alternatives sorted by savings (highest first).
+    Each entry includes cost per call, savings, and savings percentage.
+
+    Args:
+        current_model: Model ID to compare against (e.g. 'gpt-4o')
+        input_tokens: Typical input/prompt tokens per call
+        output_tokens: Typical output/completion tokens per call
+        min_tier: Minimum capability tier to consider ('economy', 'medium', 'high')
+        provider: Filter alternatives by provider ('openai', 'anthropic', etc.)
+    """
+    opt = get_optimizer()
+    prov = None
+    if provider:
+        try:
+            prov = ModelProvider(provider)
+        except ValueError:
+            pass
+    results = opt.compare_models(
+        current_model, input_tokens, output_tokens,
+        min_tier=min_tier, provider=prov,
+    )
+    return json.dumps({
+        "current_model": current_model,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "comparisons": [
+            {
+                "model": r.alternative_model,
+                "cost_per_call": r.alternative_cost_per_call,
+                "savings_per_call": r.savings_per_call,
+                "savings_percent": r.savings_percent,
+                "tier": capability_tier(r.alternative_model),
+            }
+            for r in results[:10]
+        ],
+    }, indent=2)
+
+
+@mcp.tool()
+def recommend_cheaper_model(
+    current_model: str,
+    input_tokens: int = 1000,
+    output_tokens: int = 500,
+    monthly_calls: int = 0,
+    min_tier: str | None = None,
+) -> str:
+    """Recommend the cheapest alternative model for a usage profile.
+
+    Returns the single best alternative with rationale, projected monthly
+    savings, and up to 5 runner-up alternatives.  Returns 'no recommendation'
+    if the current model is already the cheapest.
+
+    Args:
+        current_model: Current model ID (e.g. 'gpt-4o')
+        input_tokens: Typical input tokens per call
+        output_tokens: Typical output tokens per call
+        monthly_calls: Estimated calls per month (for savings projection)
+        min_tier: Minimum capability tier ('economy', 'medium', 'high')
+    """
+    opt = get_optimizer()
+    rec = opt.recommend(
+        current_model, input_tokens, output_tokens,
+        monthly_calls=monthly_calls, min_tier=min_tier,
+    )
+    if rec is None:
+        return json.dumps({
+            "recommendation": None,
+            "message": f"{current_model} is already the cheapest option"
+                       + (f" at tier >= {min_tier}" if min_tier else ""),
+        }, indent=2)
+    return json.dumps({
+        "current_model": rec.current_model,
+        "recommended_model": rec.recommended_model,
+        "current_tier": rec.current_tier,
+        "recommended_tier": rec.recommended_tier,
+        "savings_per_call": rec.savings_per_call,
+        "savings_percent": rec.savings_percent,
+        "projected_monthly_savings": rec.projected_monthly_savings,
+        "monthly_calls": rec.monthly_calls,
+        "rationale": rec.rationale,
+        "top_alternatives": [
+            {
+                "model": a.alternative_model,
+                "savings_per_call": a.savings_per_call,
+                "savings_percent": a.savings_percent,
+            }
+            for a in rec.alternatives
+        ],
+    }, indent=2)
+
+
+@mcp.tool()
+def project_model_switch(
+    from_model: str,
+    to_model: str,
+    input_tokens: int = 1000,
+    output_tokens: int = 500,
+    monthly_calls: int = 1000,
+) -> str:
+    """Project monthly cost savings from switching from one model to another.
+
+    Args:
+        from_model: Current model ID
+        to_model: Target model ID
+        input_tokens: Typical input tokens per call
+        output_tokens: Typical output tokens per call
+        monthly_calls: Estimated calls per month
+    """
+    opt = get_optimizer()
+    result = opt.project_switch(
+        from_model, to_model, input_tokens, output_tokens, monthly_calls,
+    )
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def find_cheapest_model(
+    min_tier: str = "economy",
+    input_tokens: int = 1000,
+    output_tokens: int = 500,
+    provider: str | None = None,
+) -> str:
+    """Find the cheapest model at or above a capability tier.
+
+    Useful for selecting a default model that balances cost and quality.
+
+    Args:
+        min_tier: Minimum capability tier ('economy', 'medium', 'high')
+        input_tokens: Typical input tokens per call
+        output_tokens: Typical output tokens per call
+        provider: Optional provider filter ('openai', 'anthropic', etc.)
+    """
+    opt = get_optimizer()
+    prov = None
+    if provider:
+        try:
+            prov = ModelProvider(provider)
+        except ValueError:
+            pass
+    result = opt.cheapest_for_tier(min_tier, input_tokens, output_tokens, prov)
+    if result is None:
+        return json.dumps({
+            "cheapest_model": None,
+            "message": "No models found matching criteria",
+        }, indent=2)
+    return json.dumps({
+        "cheapest_model": result.model_id,
+        "provider": result.provider,
+        "tier": result.tier,
+        "input_price_per_mtok": result.input_price_per_mtok,
+        "output_price_per_mtok": result.output_price_per_mtok,
+        "cost_per_call": result.cost_per_call,
+    }, indent=2)
 
 
 def run_server():

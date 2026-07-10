@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agent-budget"
-version = "0.10.0"
+version = "0.11.0"
 description = "MCP server + CLI for autonomous agents to manage budgets, track income/expenses, cash flow, burn rate, savings goals, spending rules, real-time cost guardrails with progressive throttling, kill switch, spend projections, and loop detection"
 readme = "README.md"
 license = "MIT"

@@ -110,6 +110,8 @@ from .models import (
     SavingsGoalStatus,
     GuardrailScope,
 )
+from .optimizer import ModelOptimizer
+from .llm_costs import ModelProvider
 
 __version__ = "0.4.0"
 
@@ -1431,6 +1433,108 @@ def create_app() -> FastAPI:
         svc = get_service()
         count = svc.clear_anomaly_events(rule_id=rule_id)
         return {"cleared": count}
+
+    # ── Model Cost Optimizer endpoints (v0.11.0) ──────────────────────
+
+    _optimizer: Optional[ModelOptimizer] = None
+
+    def get_optimizer() -> ModelOptimizer:
+        nonlocal _optimizer
+        if _optimizer is None:
+            _optimizer = ModelOptimizer()
+        return _optimizer
+
+    @app.get("/optimize/compare")
+    def compare_model_costs(
+        current_model: str,
+        input_tokens: int = 1000,
+        output_tokens: int = 500,
+        min_tier: Optional[str] = None,
+        provider: Optional[str] = None,
+    ):
+        """Compare current model cost against all alternatives."""
+        opt = get_optimizer()
+        prov = None
+        if provider:
+            try:
+                prov = ModelProvider(provider)
+            except ValueError:
+                pass
+        results = opt.compare_models(
+            current_model, input_tokens, output_tokens, min_tier, prov,
+        )
+        return {
+            "current_model": current_model,
+            "comparisons": [
+                {
+                    "model": r.alternative_model,
+                    "cost_per_call": r.alternative_cost_per_call,
+                    "savings_per_call": r.savings_per_call,
+                    "savings_percent": r.savings_percent,
+                }
+                for r in results[:10]
+            ],
+        }
+
+    @app.get("/optimize/recommend")
+    def recommend_model(
+        current_model: str,
+        input_tokens: int = 1000,
+        output_tokens: int = 500,
+        monthly_calls: int = 0,
+        min_tier: Optional[str] = None,
+    ):
+        """Get the cheapest alternative model recommendation."""
+        opt = get_optimizer()
+        rec = opt.recommend(
+            current_model, input_tokens, output_tokens, monthly_calls, min_tier,
+        )
+        if rec is None:
+            return {"recommendation": None, "message": f"{current_model} is already cheapest"}
+        return {
+            "recommended_model": rec.recommended_model,
+            "savings_per_call": rec.savings_per_call,
+            "savings_percent": rec.savings_percent,
+            "projected_monthly_savings": rec.projected_monthly_savings,
+            "rationale": rec.rationale,
+        }
+
+    @app.get("/optimize/project")
+    def project_switch(
+        from_model: str,
+        to_model: str,
+        input_tokens: int = 1000,
+        output_tokens: int = 500,
+        monthly_calls: int = 1000,
+    ):
+        """Project savings from switching models."""
+        opt = get_optimizer()
+        return opt.project_switch(from_model, to_model, input_tokens, output_tokens, monthly_calls)
+
+    @app.get("/optimize/cheapest")
+    def find_cheapest(
+        min_tier: str = "economy",
+        input_tokens: int = 1000,
+        output_tokens: int = 500,
+        provider: Optional[str] = None,
+    ):
+        """Find the cheapest model at or above a tier."""
+        opt = get_optimizer()
+        prov = None
+        if provider:
+            try:
+                prov = ModelProvider(provider)
+            except ValueError:
+                pass
+        result = opt.cheapest_for_tier(min_tier, input_tokens, output_tokens, prov)
+        if result is None:
+            return {"cheapest_model": None}
+        return {
+            "cheapest_model": result.model_id,
+            "provider": result.provider,
+            "tier": result.tier,
+            "cost_per_call": result.cost_per_call,
+        }
 
     return app
 
