@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import date
+from datetime import date, datetime
 from typing import Optional
 
 from mcp.server.fastmcp import FastMCP
@@ -2253,6 +2253,135 @@ def find_cheapest_model(
         "output_price_per_mtok": result.output_price_per_mtok,
         "cost_per_call": result.cost_per_call,
     }, indent=2)
+
+
+# --- v0.12.0: Session Cost Importer ---
+
+@mcp.tool()
+def discover_session_sources() -> str:
+    """Auto-discover AI agent session data sources on this machine.
+
+    Finds Hermes state.db databases, request dump directories, and JSONL
+    transcript files that can be imported for cost tracking.
+    """
+    svc = get_service()
+    sources = svc.discover_session_sources()
+    return json.dumps({
+        "sources_found": len(sources),
+        "sources": sources,
+    }, indent=2)
+
+
+@mcp.tool()
+def import_hermes_sessions(
+    db_path: str,
+    agent_id: str | None = None,
+    since: str | None = None,
+    dry_run: bool = False,
+    sync_to_budget: bool = False,
+    budget_id: str | None = None,
+) -> str:
+    """Import session cost data from a Hermes state.db SQLite database.
+
+    Reads token usage and cost data directly from the Hermes agent's session
+    database. This bridges observability (seeing what agents spent) with
+    enforcement (budget tracking, guardrails, loop detection).
+
+    Args:
+        db_path: Path to the Hermes state.db file
+        agent_id: Override agent_id label for all imported records
+        since: ISO date string; only import sessions after this date
+        dry_run: If True, count without persisting records
+        sync_to_budget: If True, also create expenses linked to budget_id
+        budget_id: Budget to sync expenses to
+    """
+    svc = get_service()
+    since_dt = None
+    if since:
+        try:
+            since_dt = datetime.fromisoformat(since)
+        except ValueError:
+            pass
+    result = svc.import_hermes_sessions(
+        db_path=db_path,
+        agent_id=agent_id,
+        since=since_dt,
+        dry_run=dry_run,
+        sync_to_budget=sync_to_budget,
+        budget_id=budget_id,
+    )
+    return json.dumps(result.to_dict(), indent=2)
+
+
+@mcp.tool()
+def import_jsonl_transcript(
+    file_path: str,
+    agent_id: str | None = None,
+    dry_run: bool = False,
+    sync_to_budget: bool = False,
+    budget_id: str | None = None,
+) -> str:
+    """Import session cost data from a JSONL transcript file.
+
+    Parses OpenAI/Anthropic-style JSONL transcripts where each line contains
+    model, usage (input_tokens, output_tokens), and optional timestamp fields.
+
+    Args:
+        file_path: Path to the JSONL transcript file
+        agent_id: Override agent_id label for all imported records
+        dry_run: If True, count without persisting records
+        sync_to_budget: If True, also create expenses linked to budget_id
+        budget_id: Budget to sync expenses to
+    """
+    svc = get_service()
+    result = svc.import_jsonl_transcript(
+        file_path=file_path,
+        agent_id=agent_id,
+        dry_run=dry_run,
+        sync_to_budget=sync_to_budget,
+        budget_id=budget_id,
+    )
+    return json.dumps(result.to_dict(), indent=2)
+
+
+@mcp.tool()
+def import_request_dumps(
+    dir_path: str,
+    agent_id: str | None = None,
+    since: str | None = None,
+    dry_run: bool = False,
+    sync_to_budget: bool = False,
+    budget_id: str | None = None,
+) -> str:
+    """Import cost data from Hermes API request dump JSON files.
+
+    Reads all JSON files from a dump directory. Extracts model, token counts
+    from request bodies, and estimates costs when usage data is missing.
+
+    Args:
+        dir_path: Directory containing request dump JSON files
+        agent_id: Override agent_id label for all imported records
+        since: ISO date string; only import dumps after this date
+        dry_run: If True, count without persisting records
+        sync_to_budget: If True, also create expenses linked to budget_id
+        budget_id: Budget to sync expenses to
+    """
+    svc = get_service()
+    since_dt = None
+    if since:
+        try:
+            since_dt = datetime.fromisoformat(since)
+        except ValueError:
+            pass
+    result = svc.import_request_dumps(
+        dir_path=dir_path,
+        agent_id=agent_id,
+        since=since_dt,
+        dry_run=dry_run,
+        sync_to_budget=sync_to_budget,
+        budget_id=budget_id,
+    )
+    return json.dumps(result.to_dict(), indent=2)
 
 
 def run_server():

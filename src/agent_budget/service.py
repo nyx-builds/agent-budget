@@ -29,6 +29,14 @@ from .models import (
 )
 
 from .store import BudgetStore
+from .session_importer import (
+    SessionImportResult,
+    HermesSessionImporter,
+    JSONLTranscriptImporter,
+    RequestDumpImporter,
+    discover_session_sources,
+)
+from .llm_costs import PriceCatalog
 
 
 class BudgetService:
@@ -4225,3 +4233,177 @@ class BudgetService:
             recent_events=all_events[:recent_limit],
             total_anomaly_cost_usd=total_cost,
         )
+
+    # --- v0.12.0: Session Cost Importer ---
+
+    def _get_catalog(self) -> PriceCatalog:
+        """Build a PriceCatalog with built-in + user custom prices."""
+        custom_prices = {p.model_id: p for p in self.store.list_custom_prices()}
+        return PriceCatalog(custom_prices=custom_prices)
+
+    def discover_session_sources(self) -> list[dict]:
+        """Auto-discover session data sources on the current machine.
+
+        Returns list of dicts with type, path, and description.
+        """
+        return discover_session_sources()
+
+    def import_hermes_sessions(
+        self,
+        db_path: str,
+        agent_id: Optional[str] = None,
+        since: Optional[datetime] = None,
+        dry_run: bool = False,
+        sync_to_budget: bool = False,
+        budget_id: Optional[str] = None,
+    ) -> SessionImportResult:
+        """Import session cost data from a Hermes state.db SQLite database.
+
+        Args:
+            db_path: Path to the Hermes state.db file
+            agent_id: Override agent_id for all imported records
+            since: Only import sessions started after this datetime
+            dry_run: If True, don't persist records (just count)
+            sync_to_budget: If True, also create expenses from imported records
+            budget_id: Budget to sync expenses to (required if sync_to_budget)
+
+        Returns:
+            SessionImportResult with import details
+        """
+        catalog = self._get_catalog()
+        importer = HermesSessionImporter(db_path)
+        result = importer.import_sessions(
+            catalog=catalog,
+            agent_id=agent_id,
+            since=since,
+            dry_run=dry_run,
+        )
+
+        if not dry_run:
+            for record in result.records:
+                self.store.save_llm_usage(record)
+
+            if sync_to_budget and result.records:
+                self._sync_records_to_budget(result.records, budget_id)
+
+        return result
+
+    def import_jsonl_transcript(
+        self,
+        file_path: str,
+        agent_id: Optional[str] = None,
+        dry_run: bool = False,
+        sync_to_budget: bool = False,
+        budget_id: Optional[str] = None,
+    ) -> SessionImportResult:
+        """Import session cost data from a JSONL transcript file.
+
+        Args:
+            file_path: Path to the JSONL file
+            agent_id: Override agent_id for all imported records
+            dry_run: If True, don't persist records (just count)
+            sync_to_budget: If True, also create expenses from imported records
+            budget_id: Budget to sync expenses to
+
+        Returns:
+            SessionImportResult with import details
+        """
+        catalog = self._get_catalog()
+        importer = JSONLTranscriptImporter(file_path)
+        result = importer.import_transcript(
+            catalog=catalog,
+            agent_id=agent_id,
+            dry_run=dry_run,
+        )
+
+        if not dry_run:
+            for record in result.records:
+                self.store.save_llm_usage(record)
+
+            if sync_to_budget and result.records:
+                self._sync_records_to_budget(result.records, budget_id)
+
+        return result
+
+    def import_request_dumps(
+        self,
+        dir_path: str,
+        agent_id: Optional[str] = None,
+        since: Optional[datetime] = None,
+        dry_run: bool = False,
+        sync_to_budget: bool = False,
+        budget_id: Optional[str] = None,
+    ) -> SessionImportResult:
+        """Import session cost data from Hermes API request dump files.
+
+        Args:
+            dir_path: Directory containing request dump JSON files
+            agent_id: Override agent_id for all imported records
+            since: Only import dumps after this datetime
+            dry_run: If True, don't persist records (just count)
+            sync_to_budget: If True, also create expenses from imported records
+            budget_id: Budget to sync expenses to
+
+        Returns:
+            SessionImportResult with import details
+        """
+        catalog = self._get_catalog()
+        importer = RequestDumpImporter(dir_path)
+        result = importer.import_dumps(
+            catalog=catalog,
+            agent_id=agent_id,
+            since=since,
+            dry_run=dry_run,
+        )
+
+        if not dry_run:
+            for record in result.records:
+                self.store.save_llm_usage(record)
+
+            if sync_to_budget and result.records:
+                self._sync_records_to_budget(result.records, budget_id)
+
+        return result
+
+    def _sync_records_to_budget(
+        self,
+        records: list,
+        budget_id: Optional[str] = None,
+    ) -> list:
+        """Create expenses from LLMUsageRecords, linking them to a budget.
+
+        Returns list of created Expense objects.
+        """
+        from .models import ExpenseStatus
+
+        expenses = []
+        for record in records:
+            # Expense requires amount > 0, skip zero-cost records
+            if record.cost_usd <= 0:
+                continue
+            expense_date = record.recorded_at.date() if record.recorded_at else date.today()
+            expense = Expense(
+                amount=record.cost_usd,
+                expense_date=expense_date,
+                category="AI/LLM",
+                description=f"LLM usage: {record.model_id} ({record.total_tokens:,} tokens) [{record.task_id or 'session'}]",
+                currency="USD",
+                budget_id=budget_id,
+                status=ExpenseStatus.CONFIRMED,
+                metadata={
+                    "source": "session_import",
+                    "model": record.model_id,
+                    "input_tokens": record.input_tokens,
+                    "output_tokens": record.output_tokens,
+                    "usage_record_id": record.id,
+                },
+            )
+            saved = self.store.save_expense(expense)
+
+            # Link expense back to usage record
+            record.expense_id = saved.id
+            self.store.save_llm_usage(record)
+
+            expenses.append(saved)
+
+        return expenses
