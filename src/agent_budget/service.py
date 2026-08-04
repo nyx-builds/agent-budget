@@ -37,6 +37,7 @@ from .session_importer import (
     discover_session_sources,
 )
 from .llm_costs import PriceCatalog
+from .fx import FXEngine, FXRate, MultiCurrencySummary, FXRateChangeAlert, FXRateSnapshot
 
 
 class BudgetService:
@@ -44,6 +45,7 @@ class BudgetService:
 
     def __init__(self, store: Optional[BudgetStore] = None):
         self.store = store or BudgetStore()
+        self.fx = FXEngine()
 
     # --- Budget CRUD ---
 
@@ -4407,3 +4409,185 @@ class BudgetService:
             expenses.append(saved)
 
         return expenses
+
+    # ------------------------------------------------------------------
+    # v0.13.0 — Multi-Currency FX Engine
+    # ------------------------------------------------------------------
+
+    def set_fx_rate(self, from_currency: str, to_currency: str, rate: float) -> FXRate:
+        """Set a custom exchange rate."""
+        return self.fx.set_rate(from_currency, to_currency, rate)
+
+    def get_fx_rate(self, from_currency: str, to_currency: str) -> Optional[FXRate]:
+        """Get the exchange rate for a currency pair."""
+        return self.fx.get_rate(from_currency, to_currency)
+
+    def list_fx_rates(self) -> list[FXRate]:
+        """List all custom exchange rates."""
+        return self.fx.list_rates()
+
+    def delete_fx_rate(self, from_currency: str, to_currency: str) -> bool:
+        """Remove a custom exchange rate."""
+        return self.fx.remove_rate(from_currency, to_currency)
+
+    def convert_currency(
+        self,
+        amount: float,
+        from_currency: str,
+        to_currency: str,
+    ) -> float:
+        """Convert an amount from one currency to another."""
+        return self.fx.convert(amount, from_currency, to_currency)
+
+    def get_multi_currency_summary(self, base_currency: str = "USD") -> MultiCurrencySummary:
+        """Aggregate all budgets, expenses, income, and savings into a single
+        base currency for cross-currency comparison.
+
+        This is the key feature for agents that pay for services in multiple
+        currencies (e.g., USD for OpenAI, EUR for European vendors) but need
+        a unified financial view.
+        """
+        bc = base_currency.upper()
+        rates_used: dict[str, float] = {}
+
+        # --- Budgets ---
+        budgets_by_cur: dict[str, float] = {}
+        for b in self.store.list_budgets(active_only=True):
+            cur = b.currency.upper()
+            budgets_by_cur[cur] = budgets_by_cur.get(cur, 0.0) + b.limit
+
+        total_budget = 0.0
+        for cur, amt in budgets_by_cur.items():
+            if cur == bc:
+                total_budget += amt
+                continue
+            fxr = self.fx.get_rate(cur, bc)
+            if fxr:
+                total_budget += amt * fxr.rate
+                rates_used[f"{cur}→{bc}"] = fxr.rate
+            else:
+                # Can't convert — count at face value and flag
+                total_budget += amt
+
+        # --- Expenses (current period, non-cancelled) ---
+        spending_by_cur: dict[str, float] = {}
+        for e in self.store.list_expenses():
+            if e.status.value == "cancelled":
+                continue
+            cur = e.currency.upper()
+            spending_by_cur[cur] = spending_by_cur.get(cur, 0.0) + e.amount
+
+        total_spending = 0.0
+        for cur, amt in spending_by_cur.items():
+            if cur == bc:
+                total_spending += amt
+                continue
+            fxr = self.fx.get_rate(cur, bc)
+            if fxr:
+                total_spending += amt * fxr.rate
+                if f"{cur}→{bc}" not in rates_used:
+                    rates_used[f"{cur}→{bc}"] = fxr.rate
+            else:
+                total_spending += amt
+
+        # --- Income ---
+        income_by_cur: dict[str, float] = {}
+        for i in self.store.list_income():
+            cur = i.currency.upper()
+            income_by_cur[cur] = income_by_cur.get(cur, 0.0) + i.amount
+
+        total_income = 0.0
+        for cur, amt in income_by_cur.items():
+            if cur == bc:
+                total_income += amt
+                continue
+            fxr = self.fx.get_rate(cur, bc)
+            if fxr:
+                total_income += amt * fxr.rate
+                if f"{cur}→{bc}" not in rates_used:
+                    rates_used[f"{cur}→{bc}"] = fxr.rate
+            else:
+                total_income += amt
+
+        # --- Savings ---
+        savings_by_cur: dict[str, float] = {}
+        for g in self.store.list_savings_goals(status=SavingsGoalStatus.ACTIVE.value):
+            cur = g.currency.upper()
+            savings_by_cur[cur] = savings_by_cur.get(cur, 0.0) + g.current_amount
+
+        total_savings = 0.0
+        for cur, amt in savings_by_cur.items():
+            if cur == bc:
+                total_savings += amt
+                continue
+            fxr = self.fx.get_rate(cur, bc)
+            if fxr:
+                total_savings += amt * fxr.rate
+                if f"{cur}→{bc}" not in rates_used:
+                    rates_used[f"{cur}→{bc}"] = fxr.rate
+            else:
+                total_savings += amt
+
+        currencies = sorted(
+            set(
+                list(budgets_by_cur.keys())
+                + list(spending_by_cur.keys())
+                + list(income_by_cur.keys())
+                + list(savings_by_cur.keys())
+            )
+        )
+
+        return MultiCurrencySummary(
+            base_currency=bc,
+            budgets_by_currency=budgets_by_cur,
+            total_budget_converted=round(total_budget, 2),
+            spending_by_currency=spending_by_cur,
+            total_spending_converted=round(total_spending, 2),
+            income_by_currency=income_by_cur,
+            total_income_converted=round(total_income, 2),
+            savings_by_currency=savings_by_cur,
+            total_savings_converted=round(total_savings, 2),
+            currencies_involved=currencies,
+            rates_used=rates_used,
+        )
+
+    def snapshot_fx_rates(self) -> int:
+        """Snapshot all current custom exchange rates for drift detection.
+
+        Returns the number of rates snapshotted.
+        """
+        return self.fx.snapshot_all_rates()
+
+    def get_fx_history(self, from_currency: str, to_currency: str) -> list[FXRateSnapshot]:
+        """Get rate change history for a currency pair."""
+        return self.fx.get_history(from_currency, to_currency)
+
+    def detect_fx_drift(
+        self,
+        threshold_percent: float = 5.0,
+        exposure_amount: float = 0.0,
+        exposure_currency: str = "",
+    ) -> list[FXRateChangeAlert]:
+        """Detect exchange rate drift since last snapshot.
+
+        Compares current rates against the most recent snapshots and returns
+        alerts for pairs that moved more than ``threshold_percent``.
+
+        If ``exposure_amount`` is provided (in ``exposure_currency``, which
+        should match a ``from_currency`` of a pair), each alert includes the
+        estimated financial impact — how much more or less the same exposure
+        would cost at the new rate.
+
+        Args:
+            threshold_percent: Minimum % change to trigger alert (default 5%)
+            exposure_amount: Amount to compute impact for (in from_currency)
+            exposure_currency: Currency label for the exposure amount
+
+        Returns:
+            List of drift alerts, sorted by largest absolute change.
+        """
+        return self.fx.detect_drift(threshold_percent, exposure_amount, exposure_currency)
+
+    def clear_fx_history(self, from_currency: str = "", to_currency: str = "") -> int:
+        """Clear FX rate history. If pair given, only clears that pair."""
+        return self.fx.clear_history(from_currency, to_currency)

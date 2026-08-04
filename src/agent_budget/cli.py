@@ -1923,5 +1923,226 @@ def loop_delete(config_id):
         sys.exit(1)
 
 
+# --- v0.13.0 Multi-Currency FX Commands ---
+
+
+@main.group("fx")
+def fx_group():
+    """Multi-currency exchange rate management."""
+
+
+@fx_group.command("set")
+@click.argument("from_currency")
+@click.argument("to_currency")
+@click.argument("rate", type=float)
+def fx_set(from_currency, to_currency, rate):
+    """Set a custom exchange rate.
+
+    RATE = units of TO_CURRENCY per 1 FROM_CURRENCY.
+    Example: agent-budget fx set EUR USD 1.10
+    """
+    svc = get_service()
+    try:
+        fxr = svc.set_fx_rate(from_currency, to_currency, rate)
+        console.print(
+            f"[bold green]✓ Set:[/bold green] "
+            f"1 {fxr.from_currency} = {fxr.rate} {fxr.to_currency}"
+        )
+    except ValueError as e:
+        console.print(f"[bold red]Error:[/bold red] {e}")
+        sys.exit(1)
+
+
+@fx_group.command("get")
+@click.argument("from_currency")
+@click.argument("to_currency")
+def fx_get(from_currency, to_currency):
+    """Look up an exchange rate."""
+    svc = get_service()
+    fxr = svc.get_fx_rate(from_currency, to_currency)
+    if fxr is None:
+        console.print(
+            f"[bold red]No rate:[/bold red] "
+            f"{from_currency}→{to_currency}. Use 'fx set' to add one."
+        )
+        sys.exit(1)
+    console.print(
+        f"1 {fxr.from_currency} = [bold]{fxr.rate}[/bold] {fxr.to_currency} "
+        f"[dim](source: {fxr.source})[/dim]"
+    )
+
+
+@fx_group.command("list")
+def fx_list():
+    """List all custom exchange rates."""
+    svc = get_service()
+    rates = svc.list_fx_rates()
+    if not rates:
+        console.print("[dim]No custom rates set. Using static reference table.[/dim]")
+        return
+    table = Table(title="Custom Exchange Rates")
+    table.add_column("From", style="cyan")
+    table.add_column("To", style="cyan")
+    table.add_column("Rate", justify="right", style="green")
+    table.add_column("Source", style="dim")
+    for r in rates:
+        table.add_row(r.from_currency, r.to_currency, f"{r.rate:.6f}", r.source)
+    console.print(table)
+
+
+@fx_group.command("delete")
+@click.argument("from_currency")
+@click.argument("to_currency")
+def fx_delete(from_currency, to_currency):
+    """Remove a custom exchange rate."""
+    svc = get_service()
+    if svc.delete_fx_rate(from_currency, to_currency):
+        console.print(
+            f"[bold green]✓ Deleted:[/bold green] "
+            f"{from_currency}→{to_currency}"
+        )
+    else:
+        console.print(
+            f"[bold red]Not found:[/bold red] {from_currency}→{to_currency}"
+        )
+        sys.exit(1)
+
+
+@fx_group.command("convert")
+@click.argument("amount", type=float)
+@click.argument("from_currency")
+@click.argument("to_currency")
+def fx_convert(amount, from_currency, to_currency):
+    """Convert an amount between currencies."""
+    svc = get_service()
+    try:
+        result = svc.convert_currency(amount, from_currency, to_currency)
+        fxr = svc.get_fx_rate(from_currency, to_currency)
+        rate_str = f" (rate: {fxr.rate:.6f}, source: {fxr.source})" if fxr else ""
+        console.print(
+            f"{format_currency(amount, from_currency)} = "
+            f"[bold green]{format_currency(result, to_currency)}[/bold green]"
+            f"{rate_str}"
+        )
+    except ValueError as e:
+        console.print(f"[bold red]Error:[/bold red] {e}")
+        sys.exit(1)
+
+
+@fx_group.command("summary")
+@click.option("--base", default="USD", help="Base currency to convert to")
+def fx_summary(base):
+    """Show multi-currency financial summary."""
+    svc = get_service()
+    summary = svc.get_multi_currency_summary(base)
+    console.print(
+        Panel(
+            f"[bold]Base Currency:[/bold] {summary.base_currency}\n"
+            f"Currencies: {', '.join(summary.currencies_involved) or 'none'}",
+            title="Multi-Currency Summary",
+        )
+    )
+    if summary.currencies_involved:
+        table = Table(title=f"All Amounts in {summary.base_currency}")
+        table.add_column("Category", style="cyan")
+        table.add_column("By Currency", style="yellow")
+        table.add_column(f"Total ({summary.base_currency})", justify="right", style="green")
+
+        table.add_row(
+            "Budgets",
+            ", ".join(f"{c}: {v:.2f}" for c, v in summary.budgets_by_currency.items()),
+            f"{summary.total_budget_converted:.2f}",
+        )
+        table.add_row(
+            "Spending",
+            ", ".join(f"{c}: {v:.2f}" for c, v in summary.spending_by_currency.items()),
+            f"{summary.total_spending_converted:.2f}",
+        )
+        table.add_row(
+            "Income",
+            ", ".join(f"{c}: {v:.2f}" for c, v in summary.income_by_currency.items()),
+            f"{summary.total_income_converted:.2f}",
+        )
+        table.add_row(
+            "Savings",
+            ", ".join(f"{c}: {v:.2f}" for c, v in summary.savings_by_currency.items()),
+            f"{summary.total_savings_converted:.2f}",
+        )
+        console.print(table)
+
+        if summary.rates_used:
+            console.print("\n[bold]Rates Used:[/bold]")
+            for pair, rate in summary.rates_used.items():
+                console.print(f"  {pair} = {rate:.6f}")
+
+
+@fx_group.command("snapshot")
+def fx_snapshot():
+    """Snapshot all current rates for drift detection."""
+    svc = get_service()
+    count = svc.snapshot_fx_rates()
+    console.print(f"[bold green]✓ Snapshotted {count} rate(s).[/bold green]")
+    console.print("[dim]Update rates, then run 'agent-budget fx drift' to detect changes.[/dim]")
+
+
+@fx_group.command("history")
+@click.argument("from_currency")
+@click.argument("to_currency")
+def fx_history(from_currency, to_currency):
+    """Show rate change history for a pair."""
+    svc = get_service()
+    history = svc.get_fx_history(from_currency, to_currency)
+    if not history:
+        console.print(f"[dim]No history for {from_currency}→{to_currency}.[/dim]")
+        return
+    table = Table(title=f"Rate History: {from_currency.upper()}→{to_currency.upper()}")
+    table.add_column("Rate", justify="right", style="green")
+    table.add_column("Source", style="dim")
+    table.add_column("Timestamp", style="cyan")
+    for s in history:
+        table.add_row(f"{s.rate:.6f}", s.source, s.timestamp.strftime("%Y-%m-%d %H:%M UTC"))
+    console.print(table)
+
+
+@fx_group.command("drift")
+@click.option("--threshold", default=5.0, help="Min % change to alert on")
+@click.option("--exposure", type=float, default=0.0, help="Exposure amount for impact calc")
+@click.option("--exposure-currency", default="", help="Currency of exposure amount")
+def fx_drift(threshold, exposure, exposure_currency):
+    """Detect exchange rate drift since last snapshot."""
+    svc = get_service()
+    alerts = svc.detect_fx_drift(
+        threshold_percent=threshold,
+        exposure_amount=exposure,
+        exposure_currency=exposure_currency,
+    )
+    if not alerts:
+        console.print(f"[bold green]✓ No drift detected above {threshold}%.[/bold green]")
+        return
+    console.print(f"[bold red]⚠ {len(alerts)} rate drift alert(s):[/bold red]\n")
+    for a in alerts:
+        icon = "📈" if a.direction == "up" else "📉"
+        console.print(
+            f"  {icon} {a.from_currency}→{a.to_currency}: "
+            f"{a.old_rate:.4f} → {a.new_rate:.4f} "
+            f"([bold {'red' if a.direction == 'up' else 'green'}]{a.change_percent:+.2f}%[/bold {'red' if a.direction == 'up' else 'green'}])"
+        )
+        if a.impact_amount != 0:
+            console.print(
+                f"     Impact: [bold]{a.impact_currency} {a.impact_amount:+.2f}[/bold] "
+                f"on {exposure} {a.from_currency} exposure"
+            )
+
+
+@fx_group.command("clear-history")
+@click.argument("from_currency", required=False)
+@click.argument("to_currency", required=False)
+def fx_clear_history(from_currency, to_currency):
+    """Clear FX rate history. No args = clear all."""
+    svc = get_service()
+    removed = svc.clear_fx_history(from_currency or "", to_currency or "")
+    console.print(f"[bold green]✓ Cleared {removed} snapshot(s).[/bold green]")
+
+
 if __name__ == "__main__":
     main()

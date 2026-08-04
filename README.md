@@ -7,9 +7,9 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![CI](https://github.com/nyx-builds/agent-budget/actions/workflows/ci.yml/badge.svg)](https://github.com/nyx-builds/agent-budget/actions/workflows/ci.yml)
-[![Tests: 713](https://img.shields.io/badge/tests-713%20passing-brightgreen.svg)](#testing)
+[![Tests: 809](https://img.shields.io/badge/tests-809%20passing-brightgreen.svg)](#testing)
 [![MCP](https://img.shields.io/badge/MCP-server-7c3aed)](https://modelcontextprotocol.io)
-[![Version: 0.11.0](https://img.shields.io/badge/version-0.11.0-blue.svg)](#changelog)
+[![Version: 0.13.0](https://img.shields.io/badge/version-0.13.0-blue.svg)](#changelog)
 
 [Features](#features) · [Install](#installation) · [Quick Start](#quick-start) · [MCP Setup](#mcp-server-setup) · [Python API](#python-api) · [Changelog](#changelog)
 
@@ -49,13 +49,15 @@ Stop runaway LLM costs before they happen. Agent Budget is an MCP server + CLI t
 | Spend projection / burn forecast | ✅ | ❌ | ❌ |
 | Loop detection | ✅ | ❌ | ❌ |
 | Anomaly detection | ✅ | ❌ | ❌ |
+| Multi-currency FX engine | ✅ | ❌ | ❌ |
+| FX rate drift detection | ✅ | ❌ | ❌ |
 | Model cost optimizer | ✅ | ❌ | ❌ |
 | Budget management | ✅ | ❌ | ✅ |
 | Reserve & settle (hold funds) | ✅ | ❌ | ❌ |
 | Webhooks (Slack/Discord/PagerDuty) | ✅ | ❌ | ❌ |
 | MCP server | ✅ | ✅ (CLI) | ✅ |
 | REST API | ✅ | ❌ | ❌ |
-| Tests | 677 | — | — |
+| Tests | 809 | — | — |
 
 ## Features
 
@@ -109,6 +111,17 @@ Stop runaway LLM costs before they happen. Agent Budget is an MCP server + CLI t
 - **HMAC-SHA256 signing** — Optional secret for request signature verification
 - **Retry with backoff** — Automatic retries on 5xx errors with exponential backoff
 - **Slack/Discord/PagerDuty ready** — Standard JSON POST payloads work out-of-the-box
+
+### 💱 Multi-Currency FX Engine (v0.13.0)
+- **Exchange rate management** — Set custom rates for any currency pair; overrides take priority
+- **Automatic inverse derivation** — Set EUR→USD, get USD→EUR for free
+- **USD triangulation** — Derive cross-rates (EUR→GBP) from USD-anchored pairs
+- **Static reference table** — 15 major currencies with mid-2025 estimates (zero dependencies)
+- **Multi-currency summary** — Unify budgets, spending, income, and savings into one base currency
+- **FX rate drift detection** — Snapshot rates, update them, then detect which pairs moved beyond a threshold
+- **Financial impact computation** — Quantify the budget impact of FX drift on a specific exposure amount
+- **Rate change history** — Automatic snapshots on rate overwrite; manual snapshots for periodic monitoring
+- **CLI support** — `agent-budget fx set|get|list|delete|convert|summary|snapshot|history|drift|clear-history`
 
 ### 📊 Budget Management (v0.1.0–v0.4.0)
 - **Budget tracking** — Create budgets with limits, periods, categories, rollover
@@ -425,6 +438,23 @@ src/agent_budget/
 ```
 
 ## Changelog
+
+### v0.13.0 — Multi-Currency FX Engine + Drift Detection 💱
+- **Exchange rate management** — set custom rates, auto-derive inverses and cross-rates
+- **Triangulation via USD** — derive any pair from USD-anchored rates
+- **Built-in static reference table** — 15 major currencies with mid-2025 estimates
+- **Multi-currency summary** — unify budgets, spending, income, and savings into one base currency
+- **FX rate drift detection** — snapshot rates, detect which pairs moved beyond a configurable threshold
+- **Financial impact computation** — quantify the budget impact of FX drift on specific exposure amounts
+- **Rate change history** — automatic snapshots on overwrite + manual periodic snapshots
+- **10 new MCP tools** (6 FX core + 4 drift detection)
+- **10 new CLI commands** (`fx set|get|list|delete|convert|summary|snapshot|history|drift|clear-history`)
+- 96 new tests (809 total)
+
+### v0.12.0 — Session Cost Importer 📥
+- Import from Hermes state.db, JSONL transcripts, request dumps
+- Auto-sync imported costs to budgets
+- 3 new MCP tools
 
 ### v0.11.0 — Model Cost Optimizer 🧮
 - Model comparison, recommendation, savings projection

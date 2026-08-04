@@ -2384,6 +2384,262 @@ def import_request_dumps(
     return json.dumps(result.to_dict(), indent=2)
 
 
+# --- v0.13.0 Multi-Currency FX Tools ---
+
+
+@mcp.tool()
+def set_fx_rate(from_currency: str, to_currency: str, rate: float) -> str:
+    """Set a custom exchange rate for multi-currency budgeting.
+
+    Rates are expressed as units of `to_currency` per 1 unit of `from_currency`.
+    For example, set_fx_rate("EUR", "USD", 1.10) means 1 EUR = 1.10 USD.
+
+    Custom rates take priority over the built-in static reference table.
+    Once a direct rate is set, the engine can also derive:
+      - The inverse (USD→EUR) automatically
+      - Cross-rates via USD triangulation (e.g., EUR→GBP)
+
+    Args:
+        from_currency: Source currency code (e.g., "EUR")
+        to_currency: Target currency code (e.g., "USD")
+        rate: Exchange rate (units of to_currency per from_currency), must be > 0
+    """
+    svc = get_service()
+    fxr = svc.set_fx_rate(from_currency, to_currency, rate)
+    return json.dumps({
+        "status": "ok",
+        "from_currency": fxr.from_currency,
+        "to_currency": fxr.to_currency,
+        "rate": fxr.rate,
+        "source": fxr.source,
+        "message": f"Set rate: 1 {fxr.from_currency} = {fxr.rate} {fxr.to_currency}",
+    }, indent=2)
+
+
+@mcp.tool()
+def get_fx_rate(from_currency: str, to_currency: str) -> str:
+    """Look up the exchange rate between two currencies.
+
+    Resolution order:
+      1. Exact custom rate (manual override)
+      2. Inverse of custom reverse pair
+      3. Triangulation via USD
+      4. Built-in static reference table
+
+    If `from_currency` == `to_currency`, returns rate 1.0.
+
+    Args:
+        from_currency: Source currency code
+        to_currency: Target currency code
+    """
+    svc = get_service()
+    fxr = svc.get_fx_rate(from_currency, to_currency)
+    if fxr is None:
+        return json.dumps({
+            "error": f"No exchange rate available for {from_currency}→{to_currency}",
+            "hint": f"Set a custom rate with set_fx_rate('{from_currency}', '{to_currency}', <rate>)",
+        }, indent=2)
+    return json.dumps({
+        "from_currency": fxr.from_currency,
+        "to_currency": fxr.to_currency,
+        "rate": fxr.rate,
+        "source": fxr.source,
+        "as_of": fxr.as_of.isoformat(),
+    }, indent=2)
+
+
+@mcp.tool()
+def list_fx_rates() -> str:
+    """List all custom exchange rates that have been set.
+
+    Returns the rates currently stored as manual overrides (not the
+    built-in static table).  Each entry shows the pair, rate, and source.
+    """
+    svc = get_service()
+    rates = svc.list_fx_rates()
+    return json.dumps({
+        "count": len(rates),
+        "rates": [
+            {
+                "from_currency": r.from_currency,
+                "to_currency": r.to_currency,
+                "rate": r.rate,
+                "source": r.source,
+                "updated_at": r.updated_at.isoformat(),
+            }
+            for r in rates
+        ],
+    }, indent=2)
+
+
+@mcp.tool()
+def delete_fx_rate(from_currency: str, to_currency: str) -> str:
+    """Remove a custom exchange rate.
+
+    After removal, the engine will fall back to static reference rates
+    (if available) for this currency pair.
+
+    Args:
+        from_currency: Source currency code
+        to_currency: Target currency code
+    """
+    svc = get_service()
+    removed = svc.delete_fx_rate(from_currency, to_currency)
+    return json.dumps({
+        "status": "deleted" if removed else "not_found",
+        "from_currency": from_currency.upper(),
+        "to_currency": to_currency.upper(),
+    }, indent=2)
+
+
+@mcp.tool()
+def convert_currency(
+    amount: float,
+    from_currency: str,
+    to_currency: str,
+) -> str:
+    """Convert an amount from one currency to another.
+
+    Uses the same rate resolution as get_fx_rate (custom → inverse →
+    triangulated → static).
+
+    Args:
+        amount: Amount to convert
+        from_currency: Source currency code
+        to_currency: Target currency code
+    """
+    svc = get_service()
+    try:
+        converted = svc.convert_currency(amount, from_currency, to_currency)
+        fxr = svc.get_fx_rate(from_currency, to_currency)
+        return json.dumps({
+            "amount": amount,
+            "from_currency": from_currency.upper(),
+            "converted_amount": converted,
+            "to_currency": to_currency.upper(),
+            "rate_used": fxr.rate if fxr else None,
+            "source": fxr.source if fxr else None,
+        }, indent=2)
+    except ValueError as e:
+        return json.dumps({"error": str(e)}, indent=2)
+
+
+@mcp.tool()
+def get_multi_currency_summary(base_currency: str = "USD") -> str:
+    """Get a unified financial summary converting all currencies to a base currency.
+
+    Aggregates budgets, spending, income, and savings across ALL currencies
+    into a single base currency. This is essential for agents operating
+    internationally — e.g., paying for OpenAI in USD, a European vendor in
+    EUR, and an Indian service in INR, then needing a single P&L view.
+
+    Returns:
+        - Breakdowns by original currency (budgets_by_currency, etc.)
+        - Totals converted to base_currency
+        - List of rates used for each conversion
+        - All currencies involved
+
+    Args:
+        base_currency: Target currency to convert everything into (default: USD)
+    """
+    svc = get_service()
+    summary = svc.get_multi_currency_summary(base_currency)
+    return json.dumps(summary.model_dump(), indent=2)
+
+
+@mcp.tool()
+def snapshot_fx_rates() -> str:
+    """Snapshot all current custom exchange rates for later drift detection.
+
+    Records the current value of every custom rate so you can later compare
+    after updating rates. Call this before you expect rates to change
+    (e.g., at the start of each day), then call detect_fx_drift after
+    updating rates to see what moved.
+    """
+    svc = get_service()
+    count = svc.snapshot_fx_rates()
+    return json.dumps({
+        "status": "ok",
+        "rates_snapshotted": count,
+        "message": f"Snapshotted {count} custom rate(s). Call detect_fx_drift after updating rates.",
+    }, indent=2)
+
+
+@mcp.tool()
+def get_fx_history(from_currency: str, to_currency: str) -> str:
+    """Get the change history for a currency pair.
+
+    Returns all recorded snapshots for the pair, oldest first. History is
+    recorded automatically when you overwrite an existing rate with set_fx_rate,
+    or explicitly via snapshot_fx_rates.
+
+    Args:
+        from_currency: Source currency code
+        to_currency: Target currency code
+    """
+    svc = get_service()
+    history = svc.get_fx_history(from_currency, to_currency)
+    return json.dumps({
+        "pair": f"{from_currency.upper()}→{to_currency.upper()}",
+        "count": len(history),
+        "snapshots": [
+            {
+                "rate": s.rate,
+                "source": s.source,
+                "timestamp": s.timestamp.isoformat(),
+            }
+            for s in history
+        ],
+    }, indent=2)
+
+
+@mcp.tool()
+def detect_fx_drift(
+    threshold_percent: float = 5.0,
+    exposure_amount: float = 0.0,
+    exposure_currency: str = "",
+) -> str:
+    """Detect exchange rate drift since the last snapshot.
+
+    Compares current rates to the most recent snapshots. If a pair moved
+    more than threshold_percent, an alert is generated.
+
+    This is critical for agents operating across currencies: a 10% EUR/USD
+    move silently shifts a USD budget by 10% with no usage change.
+
+    Args:
+        threshold_percent: Min % change to trigger alert (default 5%)
+        exposure_amount: If > 0, compute financial impact on this amount
+        exposure_currency: Currency of exposure_amount (for labelling)
+    """
+    svc = get_service()
+    alerts = svc.detect_fx_drift(threshold_percent, exposure_amount, exposure_currency)
+    return json.dumps({
+        "threshold_percent": threshold_percent,
+        "alerts_count": len(alerts),
+        "alerts": [a.model_dump() for a in alerts],
+    }, indent=2)
+
+
+@mcp.tool()
+def clear_fx_history(from_currency: str = "", to_currency: str = "") -> str:
+    """Clear FX rate history.
+
+    If from_currency and to_currency are provided, only clears that pair.
+    Otherwise clears all history.
+
+    Args:
+        from_currency: Source currency (empty = clear all)
+        to_currency: Target currency (empty = clear all for the source)
+    """
+    svc = get_service()
+    removed = svc.clear_fx_history(from_currency, to_currency)
+    return json.dumps({
+        "status": "cleared",
+        "snapshots_removed": removed,
+    }, indent=2)
+
+
 def run_server():
     """Run the MCP server."""
     mcp.run()
