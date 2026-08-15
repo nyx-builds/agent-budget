@@ -72,6 +72,18 @@ Endpoints:
     GET    /analytics/compare-periods    Period comparison
     GET    /analytics/budget-vs-actual   Budget vs actual comparison
 
+    # Statistical Forecasting & Scenarios (v0.14.0)
+    GET    /analytics/statistical-forecast   Statistical forecast (per budget or all)
+    GET    /analytics/projected-breaches    Predicted budget overruns
+    GET    /analytics/forecast-backtest     Method accuracy comparison
+    GET    /analytics/runway                Cash runway analysis
+    POST   /scenarios                       Create a what-if scenario
+    GET    /scenarios                       List scenarios
+    GET    /scenarios/{scenario_id}         Get a scenario
+    DELETE /scenarios/{scenario_id}         Delete a scenario
+    POST   /scenarios/{scenario_id}/run     Run a saved scenario
+    POST   /scenarios/run-adhoc             Run an unsaved scenario
+
     # Budget Templates
     GET    /templates                    List budget templates
     GET    /templates/{template_id}      Get a template
@@ -249,6 +261,19 @@ class UpdateSavingsGoalRequest(BaseModel):
 class ContributeRequest(BaseModel):
     amount: float
     note: str = ""
+
+
+class CreateScenarioRequest(BaseModel):
+    name: str
+    description: str = ""
+    adjustments: list[dict] = Field(default_factory=list)
+    horizon_periods: int = Field(default=6, ge=1, le=36)
+    method: str = Field(default="auto", pattern="^(auto|moving_average|linear_trend|holt_winters)$")
+
+
+class RunScenarioRequest(CreateScenarioRequest):
+    """Ad-hoc scenario run — same fields, nothing persisted."""
+    pass
 
 
 class CreateSpendingRuleRequest(BaseModel):
@@ -931,6 +956,139 @@ def create_app() -> FastAPI:
         svc = get_service()
         cleared = svc.store.clear_alerts(budget_id=budget_id)
         return {"cleared": cleared}
+
+    # -- Forecasting & Scenarios (v0.14.0) -------------------------------
+
+    @app.get("/analytics/statistical-forecast")
+    def statistical_forecast(
+        budget_id: Optional[str] = None,
+        horizon_periods: int = Query(default=6, ge=1, le=36),
+        method: str = Query(default="auto", pattern="^(auto|moving_average|linear_trend|holt_winters)$"),
+        history_periods: int = Query(default=12, ge=2, le=60),
+        interval_confidence: float = Query(default=0.8, ge=0.5, le=0.999),
+    ):
+        from agent_budget.forecast import ForecastMethod
+        svc = get_service()
+        if budget_id:
+            try:
+                fc = svc.get_budget_forecast(
+                    budget_id,
+                    horizon_periods=horizon_periods,
+                    method=ForecastMethod(method),
+                    history_periods=history_periods,
+                    interval_confidence=interval_confidence,
+                )
+                return fc.model_dump(mode="json")
+            except ValueError as e:
+                raise _err(404, str(e))
+        forecasts = svc.forecast_all_budgets(
+            horizon_periods=horizon_periods,
+            method=ForecastMethod(method),
+            history_periods=history_periods,
+        )
+        return [f.model_dump(mode="json") for f in forecasts]
+
+    @app.get("/analytics/projected-breaches")
+    def projected_breaches(
+        horizon_periods: int = Query(default=6, ge=1, le=36),
+        method: str = Query(default="auto", pattern="^(auto|moving_average|linear_trend|holt_winters)$"),
+        history_periods: int = Query(default=12, ge=2, le=60),
+    ):
+        from agent_budget.forecast import ForecastMethod
+        svc = get_service()
+        breaches = svc.projected_breaches(
+            horizon_periods=horizon_periods,
+            method=ForecastMethod(method),
+            history_periods=history_periods,
+        )
+        return {
+            "horizon_periods": horizon_periods,
+            "breach_count": len(breaches),
+            "breaches": [b.model_dump(mode="json") for b in breaches],
+        }
+
+    @app.get("/analytics/forecast-backtest")
+    def forecast_backtest(
+        budget_id: str = Query(...),
+        history_periods: int = Query(default=12, ge=2, le=60),
+    ):
+        svc = get_service()
+        try:
+            results = svc.backtest_methods(budget_id, history_periods=history_periods)
+        except ValueError as e:
+            raise _err(404, str(e))
+        return [r.model_dump(mode="json") for r in results]
+
+    @app.get("/analytics/runway")
+    def runway_analysis(
+        months: int = Query(default=6, ge=1, le=36),
+        currency: str = Query(default="USD", min_length=3, max_length=3),
+    ):
+        svc = get_service()
+        analysis = svc.analyze_runway(months=months, currency=currency.upper())
+        return analysis.model_dump(mode="json")
+
+    @app.post("/scenarios")
+    def create_scenario(body: CreateScenarioRequest):
+        from agent_budget.forecast import ForecastMethod
+        svc = get_service()
+        try:
+            scenario = svc.create_scenario(
+                name=body.name,
+                adjustments=body.adjustments,
+                horizon_periods=body.horizon_periods,
+                method=ForecastMethod(body.method),
+                description=body.description,
+            )
+        except ValueError as e:
+            raise _err(400, str(e))
+        return scenario.model_dump(mode="json")
+
+    @app.get("/scenarios")
+    def list_scenarios():
+        svc = get_service()
+        return [s.model_dump(mode="json") for s in svc.list_scenarios()]
+
+    @app.post("/scenarios/run-adhoc")
+    def run_adhoc_scenario(body: RunScenarioRequest):
+        """Run an unsaved what-if scenario against current data."""
+        from agent_budget.forecast import ForecastMethod, Scenario, ScenarioAdjustment
+        svc = get_service()
+        scenario = Scenario(
+            name=body.name,
+            description=body.description,
+            adjustments=[ScenarioAdjustment(**a) for a in (body.adjustments or [])],
+            horizon_periods=body.horizon_periods,
+            method=ForecastMethod(body.method),
+        )
+        result = svc.run_scenario(scenario)
+        data = result.model_dump(mode="json")
+        data["scenario_id"] = scenario.id
+        return data
+
+    @app.get("/scenarios/{scenario_id}")
+    def get_scenario(scenario_id: str):
+        svc = get_service()
+        scenario = svc.get_scenario(scenario_id)
+        if not scenario:
+            raise _err(404, f"Scenario {scenario_id} not found")
+        return scenario.model_dump(mode="json")
+
+    @app.delete("/scenarios/{scenario_id}")
+    def delete_scenario(scenario_id: str):
+        svc = get_service()
+        if not svc.delete_scenario(scenario_id):
+            raise _err(404, f"Scenario {scenario_id} not found")
+        return {"deleted": scenario_id}
+
+    @app.post("/scenarios/{scenario_id}/run")
+    def run_scenario(scenario_id: str):
+        svc = get_service()
+        try:
+            result = svc.run_saved_scenario(scenario_id)
+        except ValueError as e:
+            raise _err(404, str(e))
+        return result.model_dump(mode="json")
 
     # -- Data I/O -------------------------------------------------------
 

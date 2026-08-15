@@ -18,6 +18,7 @@ from .models import (
     SpendReservation, ReservationStatus,
     SpendAnomalyRule, AnomalyEvent,
 )
+from .forecast import Scenario
 from .llm_costs import LLMUsageRecord, ModelPrice, ModelProvider
 
 
@@ -48,6 +49,7 @@ class BudgetStore:
         self._reservations_file = self.data_dir / "reservations.json"
         self._anomaly_rules_file = self.data_dir / "anomaly_rules.json"
         self._anomaly_events_file = self.data_dir / "anomaly_events.json"
+        self._scenarios_file = self.data_dir / "scenarios.json"
         # v0.9.0: Process-wide lock so concurrent guardrail check+reserve
         # operations are atomic within a single Python process.  This is the
         # mechanism that makes the reserve/settle protocol hold under fan-out.
@@ -931,3 +933,32 @@ class BudgetStore:
             count = len(to_delete)
             self._write_json(self._anomaly_events_file, [e.model_dump() for e in to_keep])
             return count
+
+    # --- Scenarios (v0.14.0) ---
+
+    def save_scenario(self, scenario: Scenario) -> Scenario:
+        scenarios = [
+            s for s in self.list_scenarios() if s.id != scenario.id
+        ]
+        scenarios.append(scenario)
+        with self._lock:
+            self._write_json(self._scenarios_file, [s.model_dump() for s in scenarios])
+        return scenario
+
+    def list_scenarios(self) -> list[Scenario]:
+        return [Scenario(**d) for d in self._read_json(self._scenarios_file)]
+
+    def get_scenario(self, scenario_id: str) -> Optional[Scenario]:
+        for s in self.list_scenarios():
+            if s.id == scenario_id:
+                return s
+        return None
+
+    def delete_scenario(self, scenario_id: str) -> bool:
+        scenarios = self.list_scenarios()
+        remaining = [s for s in scenarios if s.id != scenario_id]
+        if len(remaining) == len(scenarios):
+            return False
+        with self._lock:
+            self._write_json(self._scenarios_file, [s.model_dump() for s in remaining])
+        return True

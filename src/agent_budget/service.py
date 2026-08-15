@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
@@ -38,6 +39,30 @@ from .session_importer import (
 )
 from .llm_costs import PriceCatalog
 from .fx import FXEngine, FXRate, MultiCurrencySummary, FXRateChangeAlert, FXRateSnapshot
+from .forecast import (
+    ForecastMethod,
+    BudgetForecast,
+    ForecastPoint,
+    BacktestResult,
+    Scenario,
+    ScenarioAdjustment,
+    ScenarioResult,
+    ProjectedBreach,
+    RunwayAnalysis,
+    moving_average_forecast,
+    holt_linear_forecast,
+    holt_winters_forecast,
+    backtest,
+    select_best_method,
+    z_score,
+    residual_sigma,
+    advance_period,
+    retreat_period,
+    period_start_for,
+    period_label,
+    build_history,
+    apply_adjustments,
+)
 
 
 class BudgetService:
@@ -4591,3 +4616,416 @@ class BudgetService:
     def clear_fx_history(self, from_currency: str = "", to_currency: str = "") -> int:
         """Clear FX rate history. If pair given, only clears that pair."""
         return self.fx.clear_history(from_currency, to_currency)
+
+    # ------------------------------------------------------------------
+    # v0.14.0 — Statistical Forecasting & Scenario Engine
+    # ------------------------------------------------------------------
+
+    def _amt_in(self, amount: float, from_currency: str, to_currency: str) -> float:
+        """Convert an amount into ``to_currency`` (1:1 fallback if no rate)."""
+        if from_currency.upper() == to_currency.upper():
+            return amount
+        try:
+            return self.fx.convert(amount, from_currency, to_currency)
+        except ValueError:
+            return amount
+
+    def _spend_between(self, budget: Budget, start: date, end: date) -> float:
+        """Non-cancelled spend for a budget between two dates, in budget currency."""
+        expenses = self.store.list_expenses(
+            budget_id=budget.id, start_date=start, end_date=end,
+        )
+        return sum(
+            self._amt_in(e.amount, e.currency, budget.currency)
+            for e in expenses
+            if e.status.value != "cancelled"
+        )
+
+    def _forecast_history(
+        self,
+        budget: Budget,
+        history_periods: int,
+        ref_date: Optional[date] = None,
+    ) -> tuple[list[float], date]:
+        """Collect the last ``history_periods`` COMPLETE periods plus current start.
+
+        The current (partial) period is excluded from history so an
+        in-progress period cannot distort the level/trend estimates.
+        Returns ``(history_oldest_first, current_period_start)``.
+        """
+        ref = ref_date or date.today()
+        current_start = period_start_for(budget.period, ref)
+        history: list[float] = []
+        for i in range(history_periods, 0, -1):
+            s = retreat_period(current_start, budget.period, i)
+            e = advance_period(s, budget.period) - timedelta(days=1)
+            history.append(round(self._spend_between(budget, s, e), 4))
+        return history, current_start
+
+    def get_budget_forecast(
+        self,
+        budget_id: str,
+        horizon_periods: int = 6,
+        method: ForecastMethod = ForecastMethod.AUTO,
+        history_periods: int = 12,
+        interval_confidence: float = 0.8,
+        ref_date: Optional[date] = None,
+    ) -> BudgetForecast:
+        """Statistical forecast of future spend for one budget.
+
+        Walk-forward backtesting selects the best method when
+        ``method=AUTO``; prediction intervals widen with sqrt(horizon).
+        """
+        if horizon_periods < 1 or horizon_periods > 36:
+            raise ValueError("horizon_periods must be between 1 and 36")
+        if history_periods < 2:
+            raise ValueError("history_periods must be at least 2")
+        budget = self.store.get_budget(budget_id)
+        if not budget:
+            raise ValueError(f"Budget {budget_id} not found")
+
+        history, current_start = self._forecast_history(budget, history_periods, ref_date)
+
+        if method == ForecastMethod.AUTO:
+            chosen, bt = select_best_method(history)
+        else:
+            chosen = method
+            bt = backtest(history, chosen)
+
+        preds = _method_forecast_public(chosen, history, horizon_periods)
+        sigma = residual_sigma(history, chosen)
+
+        try:
+            z = z_score(interval_confidence)
+        except Exception:
+            z = 1.282
+
+        points: list[ForecastPoint] = []
+        for h, p in enumerate(preds, start=1):
+            width = z * sigma * math.sqrt(h)
+            points.append(ForecastPoint(
+                period_index=h,
+                period_label=period_label(
+                    advance_period(current_start, budget.period, h - 1), budget.period
+                ),
+                predicted=round(p, 2),
+                lower_bound=round(max(0.0, p - width), 2),
+                upper_bound=round(p + width, 2),
+            ))
+
+        confidence = min(0.95, 0.2 + 0.1 * len(history))
+        if bt.mape is not None and bt.tested_points > 0:
+            confidence *= max(0.2, 1.0 - bt.mape / 200.0)
+
+        return BudgetForecast(
+            budget_id=budget.id,
+            budget_name=budget.name,
+            method=method,
+            method_selected=chosen if method == ForecastMethod.AUTO else None,
+            points=points,
+            history_points=len(history),
+            history_used=history,
+            total_predicted=round(sum(p.predicted for p in points), 2),
+            mean_absolute_error=bt.mae,
+            mape=bt.mape,
+            confidence=round(confidence, 2),
+            interval_confidence=interval_confidence,
+        )
+
+    def forecast_all_budgets(
+        self,
+        horizon_periods: int = 6,
+        method: ForecastMethod = ForecastMethod.AUTO,
+        history_periods: int = 12,
+        ref_date: Optional[date] = None,
+    ) -> list[BudgetForecast]:
+        """Statistical forecasts for every active budget, with breach scan."""
+        budgets = self.store.list_budgets(active_only=True)
+        return [
+            self.get_budget_forecast(
+                b.id,
+                horizon_periods=horizon_periods,
+                method=method,
+                history_periods=history_periods,
+                ref_date=ref_date,
+            )
+            for b in budgets
+        ]
+
+    def projected_breaches(
+        self,
+        horizon_periods: int = 6,
+        method: ForecastMethod = ForecastMethod.AUTO,
+        history_periods: int = 12,
+        ref_date: Optional[date] = None,
+    ) -> list[ProjectedBreach]:
+        """Future periods where forecasted spend exceeds the budget limit."""
+        breaches: list[ProjectedBreach] = []
+        for fc in self.forecast_all_budgets(
+            horizon_periods=horizon_periods,
+            method=method,
+            history_periods=history_periods,
+            ref_date=ref_date,
+        ):
+            budget = self.store.get_budget(fc.budget_id)
+            if not budget:
+                continue
+            for pt in fc.points:
+                if pt.predicted > budget.limit:
+                    breaches.append(ProjectedBreach(
+                        budget_id=budget.id,
+                        budget_name=budget.name,
+                        period_index=pt.period_index,
+                        period_label=pt.period_label,
+                        projected_spend=pt.predicted,
+                        limit=budget.limit,
+                        overrun=round(pt.predicted - budget.limit, 2),
+                        overrun_percent=round((pt.predicted - budget.limit) / budget.limit * 100, 1),
+                    ))
+        return breaches
+
+    def backtest_methods(
+        self,
+        budget_id: str,
+        history_periods: int = 12,
+        ref_date: Optional[date] = None,
+    ) -> list[BacktestResult]:
+        """Walk-forward accuracy of every concrete method for one budget."""
+        budget = self.store.get_budget(budget_id)
+        if not budget:
+            raise ValueError(f"Budget {budget_id} not found")
+        history, _ = self._forecast_history(budget, history_periods, ref_date)
+        return [
+            backtest(history, m)
+            for m in (ForecastMethod.MOVING_AVERAGE, ForecastMethod.LINEAR_TREND, ForecastMethod.HOLT_WINTERS)
+        ]
+
+    # -- Scenarios -----------------------------------------------------
+
+    @staticmethod
+    def _adjustment_applies(adj: ScenarioAdjustment, budget: Budget) -> bool:
+        if adj.target_type == "all":
+            return True
+        tid = (adj.target_id or "").strip().lower()
+        if not tid:
+            return False
+        if adj.target_type == "category":
+            return bool(budget.category) and budget.category.lower() == tid
+        return tid in (budget.id.lower(), budget.name.lower())
+
+    def run_scenario(
+        self,
+        scenario: Scenario,
+        ref_date: Optional[date] = None,
+    ) -> ScenarioResult:
+        """Apply a what-if scenario over baseline forecasts of active budgets."""
+        budgets = self.store.list_budgets(active_only=True)
+        baseline_totals = [0.0] * scenario.horizon_periods
+        scenario_totals = [0.0] * scenario.horizon_periods
+        labels: list[str] = []
+        breaches: list[ProjectedBreach] = []
+
+        for budget in budgets:
+            history, current_start = self._forecast_history(budget, 12, ref_date)
+            if scenario.method == ForecastMethod.AUTO:
+                chosen, _ = select_best_method(history)
+            else:
+                chosen = scenario.method
+            baseline = _method_forecast_public(chosen, history, scenario.horizon_periods)
+            adjusted = apply_adjustments(
+                baseline,
+                [a for a in scenario.adjustments if self._adjustment_applies(a, budget)],
+            )
+
+            if not labels:
+                labels = [
+                    period_label(
+                        advance_period(current_start, budget.period, h - 1), budget.period
+                    )
+                    for h in range(1, scenario.horizon_periods + 1)
+                ]
+
+            for i, (b, s) in enumerate(zip(baseline, adjusted)):
+                baseline_totals[i] += b
+                scenario_totals[i] += s
+                if s > budget.limit:
+                    breaches.append(ProjectedBreach(
+                        budget_id=budget.id,
+                        budget_name=budget.name,
+                        period_index=i + 1,
+                        period_label=labels[i],
+                        projected_spend=round(s, 2),
+                        limit=budget.limit,
+                        overrun=round(s - budget.limit, 2),
+                        overrun_percent=round((s - budget.limit) / budget.limit * 100, 1),
+                    ))
+
+        base_total = sum(baseline_totals)
+        scen_total = sum(scenario_totals)
+        return ScenarioResult(
+            scenario_id=scenario.id,
+            scenario_name=scenario.name,
+            baseline_total=round(base_total, 2),
+            scenario_total=round(scen_total, 2),
+            delta=round(scen_total - base_total, 2),
+            delta_percent=round((scen_total - base_total) / base_total * 100, 1) if base_total > 1e-9 else 0.0,
+            per_period=[
+                {
+                    "period_index": i + 1,
+                    "period_label": labels[i] if labels else f"Period {i + 1}",
+                    "baseline": round(b, 2),
+                    "scenario": round(s, 2),
+                    "delta": round(s - b, 2),
+                }
+                for i, (b, s) in enumerate(zip(baseline_totals, scenario_totals))
+            ],
+            projected_breaches=breaches,
+        )
+
+    def save_scenario(self, scenario: Scenario) -> Scenario:
+        return self.store.save_scenario(scenario)
+
+    def create_scenario(
+        self,
+        name: str,
+        adjustments: Optional[list[dict]] = None,
+        horizon_periods: int = 6,
+        method: ForecastMethod = ForecastMethod.AUTO,
+        description: str = "",
+    ) -> Scenario:
+        scenario = Scenario(
+            name=name,
+            description=description,
+            adjustments=[ScenarioAdjustment(**a) for a in (adjustments or [])],
+            horizon_periods=horizon_periods,
+            method=method,
+        )
+        return self.store.save_scenario(scenario)
+
+    def list_scenarios(self) -> list[Scenario]:
+        return self.store.list_scenarios()
+
+    def get_scenario(self, scenario_id: str) -> Optional[Scenario]:
+        return self.store.get_scenario(scenario_id)
+
+    def delete_scenario(self, scenario_id: str) -> bool:
+        return self.store.delete_scenario(scenario_id)
+
+    def run_saved_scenario(self, scenario_id: str, ref_date: Optional[date] = None) -> ScenarioResult:
+        scenario = self.store.get_scenario(scenario_id)
+        if not scenario:
+            raise ValueError(f"Scenario {scenario_id} not found")
+        return self.run_scenario(scenario, ref_date=ref_date)
+
+    # -- Runway ---------------------------------------------------------
+
+    def analyze_runway(
+        self,
+        months: int = 6,
+        currency: str = "USD",
+        ref_date: Optional[date] = None,
+    ) -> RunwayAnalysis:
+        """How long total funds last at the observed net burn rate.
+
+        Unlike the savings-based runway in ``get_burn_rate``, this uses the
+        ALL-TIME cash balance (income received - expenses paid) and a linear
+        trend on monthly net burn.
+        """
+        if months < 1:
+            raise ValueError("months must be at least 1")
+        ref = ref_date or date.today()
+
+        nets: list[float] = []
+        exp_total = 0.0
+        inc_total = 0.0
+        for i in range(months, 0, -1):
+            ms = retreat_period(ref.replace(day=1), BudgetPeriod.MONTHLY, i)
+            me = advance_period(ms, BudgetPeriod.MONTHLY) - timedelta(days=1)
+            exp = sum(
+                self._amt_in(e.amount, e.currency, currency)
+                for e in self.store.list_expenses(start_date=ms, end_date=me)
+                if e.status.value != "cancelled"
+            )
+            inc = sum(
+                self._amt_in(x.amount, x.currency, currency)
+                for x in self.list_income(start_date=ms, end_date=me)
+                if x.status != IncomeStatus.CANCELLED
+            )
+            nets.append(exp - inc)
+            exp_total += exp
+            inc_total += inc
+
+        monthly_expenses = exp_total / months
+        monthly_income = inc_total / months
+        monthly_burn = monthly_expenses - monthly_income
+
+        # Linear trend of net burn over time (slope via least squares)
+        n = len(nets)
+        if n >= 2:
+            x_mean = (n - 1) / 2
+            y_mean = sum(nets) / n
+            denom = sum((i - x_mean) ** 2 for i in range(n))
+            burn_trend = (
+                sum((i - x_mean) * (nets[i] - y_mean) for i in range(n)) / denom
+                if denom > 0 else 0.0
+            )
+        else:
+            burn_trend = 0.0
+
+        # All-time balance in target currency
+        balance = sum(
+            self._amt_in(x.amount, x.currency, currency)
+            for x in self.list_income()
+            if x.status != IncomeStatus.CANCELLED
+        ) - sum(
+            self._amt_in(e.amount, e.currency, currency)
+            for e in self.store.list_expenses()
+            if e.status.value != "cancelled"
+        )
+
+        runway_months: Optional[float] = None
+        exhaustion_date: Optional[date] = None
+        if monthly_burn > 1e-9 and balance >= 0:
+            runway_months = balance / monthly_burn
+            exhaustion_date = ref + timedelta(days=int(runway_months * 30.44))
+        elif monthly_burn > 1e-9 and balance < 0:
+            runway_months = 0.0
+            exhaustion_date = ref
+
+        projection: list[dict] = []
+        bal = balance
+        if runway_months is not None:
+            proj_len = min(12, max(1, int(runway_months) + 2))
+        else:
+            proj_len = 12
+        for m in range(1, proj_len + 1):
+            burn_m = monthly_burn + burn_trend * (m - 1)
+            bal = bal - burn_m
+            projection.append({
+                "month_index": m,
+                "projected_burn": round(burn_m, 2),
+                "projected_balance": round(bal, 2),
+            })
+
+        return RunwayAnalysis(
+            currency=currency,
+            balance=round(balance, 2),
+            monthly_burn=round(monthly_burn, 2),
+            burn_trend_per_month=round(burn_trend, 2),
+            runway_months=round(runway_months, 1) if runway_months is not None else None,
+            exhaustion_date=exhaustion_date,
+            profitable=monthly_burn <= 0,
+            monthly_income=round(monthly_income, 2),
+            monthly_expenses=round(monthly_expenses, 2),
+            projection=projection,
+            method_note=(
+                f"Linear-trend burn over {months} complete months; balance = "
+                f"all-time income - expenses in {currency}."
+            ),
+        )
+
+
+def _method_forecast_public(method: ForecastMethod, history: list[float], horizon: int) -> list[float]:
+    """Dispatch to a concrete forecast function (AUTO is resolved upstream)."""
+    from .forecast import _method_forecast
+    return _method_forecast(method, history, horizon)

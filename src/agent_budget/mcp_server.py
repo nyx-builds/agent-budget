@@ -2640,6 +2640,205 @@ def clear_fx_history(from_currency: str = "", to_currency: str = "") -> str:
     }, indent=2)
 
 
+# --- v0.14.0 Statistical Forecasting & Scenario Tools ---
+
+@mcp.tool()
+def forecast_budget(
+    budget_id: str,
+    horizon_periods: int = 6,
+    method: str = "auto",
+    history_periods: int = 12,
+    interval_confidence: float = 0.8,
+) -> str:
+    """Statistical forecast of future spend for one budget.
+
+    Uses walk-forward backtesting to auto-select the best method
+    (moving average, Holt linear trend, or Holt-Winters seasonal) and
+    returns prediction intervals that widen with the horizon.
+
+    Args:
+        budget_id: Budget to forecast
+        horizon_periods: How many future periods to predict (1-36)
+        method: 'auto', 'moving_average', 'linear_trend', or 'holt_winters'
+        history_periods: How many past complete periods to learn from (min 2)
+        interval_confidence: Nominal coverage of prediction intervals (0.5-0.999)
+    """
+    from .forecast import ForecastMethod
+    svc = get_service()
+    fc = svc.get_budget_forecast(
+        budget_id,
+        horizon_periods=horizon_periods,
+        method=ForecastMethod(method),
+        history_periods=history_periods,
+        interval_confidence=interval_confidence,
+    )
+    return json.dumps(fc.model_dump(mode="json"), indent=2)
+
+
+@mcp.tool()
+def forecast_all_budgets(
+    horizon_periods: int = 6,
+    method: str = "auto",
+    history_periods: int = 12,
+) -> str:
+    """Statistical forecasts for every active budget.
+
+    Args:
+        horizon_periods: How many future periods to predict (1-36)
+        method: 'auto', 'moving_average', 'linear_trend', or 'holt_winters'
+        history_periods: How many past complete periods to learn from (min 2)
+    """
+    from .forecast import ForecastMethod
+    svc = get_service()
+    forecasts = svc.forecast_all_budgets(
+        horizon_periods=horizon_periods,
+        method=ForecastMethod(method),
+        history_periods=history_periods,
+    )
+    return json.dumps([f.model_dump(mode="json") for f in forecasts], indent=2)
+
+
+@mcp.tool()
+def get_projected_breaches(
+    horizon_periods: int = 6,
+    method: str = "auto",
+    history_periods: int = 12,
+) -> str:
+    """Predict which budgets will exceed their limits, and when.
+
+    Scans statistical forecasts of all active budgets and returns every
+    future period where predicted spend exceeds the budget limit, with
+    overrun amount and percentage.
+
+    Args:
+        horizon_periods: How many future periods to scan (1-36)
+        method: 'auto', 'moving_average', 'linear_trend', or 'holt_winters'
+        history_periods: How many past complete periods to learn from (min 2)
+    """
+    from .forecast import ForecastMethod
+    svc = get_service()
+    breaches = svc.projected_breaches(
+        horizon_periods=horizon_periods,
+        method=ForecastMethod(method),
+        history_periods=history_periods,
+    )
+    return json.dumps({
+        "horizon_periods": horizon_periods,
+        "breach_count": len(breaches),
+        "breaches": [b.model_dump(mode="json") for b in breaches],
+    }, indent=2)
+
+
+@mcp.tool()
+def backtest_forecast_methods(budget_id: str, history_periods: int = 12) -> str:
+    """Compare walk-forward accuracy of each forecasting method.
+
+    Returns MAPE, RMSE, and MAE for moving average, Holt linear trend,
+    and Holt-Winters on this budget's history so you can see why 'auto'
+    picked what it did.
+
+    Args:
+        budget_id: Budget whose history to evaluate
+        history_periods: How many past complete periods to use (min 2)
+    """
+    svc = get_service()
+    results = svc.backtest_methods(budget_id, history_periods=history_periods)
+    return json.dumps([r.model_dump(mode="json") for r in results], indent=2)
+
+
+@mcp.tool()
+def run_what_if_scenario(
+    name: str,
+    adjustments: list[dict] | None = None,
+    horizon_periods: int = 6,
+    method: str = "auto",
+    description: str = "",
+    save: bool = False,
+) -> str:
+    """Run a what-if scenario over baseline spend forecasts.
+
+    Adjustments layer on top of the statistical baseline:
+    - {"percent_change": -20} — scale spend down 20%
+    - {"absolute_per_period": 500} — override spend to 500/period
+    - {"one_off_amount": 300, "one_off_period": 2} — single spike in period 2
+    - {"target_type": "category", "target_id": "llm", "percent_change": 50}
+    Returns baseline vs scenario totals, per-period deltas, and projected
+    budget breaches under the scenario.
+
+    Args:
+        name: Scenario name
+        adjustments: List of adjustment dicts (see above)
+        horizon_periods: Forecast horizon in periods (1-36)
+        method: 'auto', 'moving_average', 'linear_trend', or 'holt_winters'
+        description: Optional description
+        save: Persist the scenario for later re-running
+    """
+    from .forecast import ForecastMethod, Scenario, ScenarioAdjustment
+    svc = get_service()
+    scenario = Scenario(
+        name=name,
+        description=description,
+        adjustments=[ScenarioAdjustment(**a) for a in (adjustments or [])],
+        horizon_periods=horizon_periods,
+        method=ForecastMethod(method),
+    )
+    result = svc.run_scenario(scenario)
+    if save:
+        svc.save_scenario(scenario)
+    data = result.model_dump(mode="json")
+    data["scenario_id"] = scenario.id
+    data["saved"] = save
+    return json.dumps(data, indent=2)
+
+
+@mcp.tool()
+def analyze_cash_runway(months: int = 6, currency: str = "USD") -> str:
+    """How long total funds last at the observed net burn rate.
+
+    Uses all-time cash balance (income received - expenses paid) and a
+    linear trend on monthly net burn to project the exhaustion date and
+    a month-by-month balance projection.
+
+    Args:
+        months: How many complete months of history to average over (min 1)
+        currency: Reporting currency (FX-converted where rates exist)
+    """
+    svc = get_service()
+    analysis = svc.analyze_runway(months=months, currency=currency)
+    return json.dumps(analysis.model_dump(mode="json"), indent=2)
+
+
+@mcp.tool()
+def list_scenarios() -> str:
+    """List saved what-if scenarios."""
+    svc = get_service()
+    return json.dumps([s.model_dump(mode="json") for s in svc.list_scenarios()], indent=2)
+
+
+@mcp.tool()
+def run_saved_scenario(scenario_id: str) -> str:
+    """Re-run a saved what-if scenario against current data.
+
+    Args:
+        scenario_id: ID of the saved scenario (SCN-...)
+    """
+    svc = get_service()
+    result = svc.run_saved_scenario(scenario_id)
+    return json.dumps(result.model_dump(mode="json"), indent=2)
+
+
+@mcp.tool()
+def delete_scenario(scenario_id: str) -> str:
+    """Delete a saved what-if scenario.
+
+    Args:
+        scenario_id: ID of the scenario to delete (SCN-...)
+    """
+    svc = get_service()
+    deleted = svc.delete_scenario(scenario_id)
+    return json.dumps({"deleted": deleted, "scenario_id": scenario_id}, indent=2)
+
+
 def run_server():
     """Run the MCP server."""
     mcp.run()

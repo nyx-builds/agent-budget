@@ -2144,5 +2144,283 @@ def fx_clear_history(from_currency, to_currency):
     console.print(f"[bold green]✓ Cleared {removed} snapshot(s).[/bold green]")
 
 
+# --- v0.14.0 Statistical Forecasting & Scenarios CLI ---
+
+@main.group("predict")
+def predict_group():
+    """Statistical forecasting, scenarios, and cash runway."""
+
+
+_METHOD_CHOICES = ("auto", "moving_average", "linear_trend", "holt_winters")
+
+
+@predict_group.command("forecast")
+@click.argument("budget_id")
+@click.option("--horizon", "-h", default=6, type=int, help="Periods to forecast (default 6)")
+@click.option("--method", "-m", "method", default="auto", type=click.Choice(_METHOD_CHOICES))
+@click.option("--history", default=12, type=int, help="Past periods to learn from (default 12)")
+@click.option("--confidence", default=0.8, type=float, help="Interval confidence (default 0.8)")
+def predict_forecast(budget_id, horizon, method, history, confidence):
+    """Statistical forecast for one budget, with prediction intervals."""
+    from .forecast import ForecastMethod
+    svc = get_service()
+    try:
+        fc = svc.get_budget_forecast(
+            budget_id,
+            horizon_periods=horizon,
+            method=ForecastMethod(method),
+            history_periods=history,
+            interval_confidence=confidence,
+        )
+    except ValueError as e:
+        console.print(f"[bold red]Error:[/bold red] {e}")
+        sys.exit(1)
+
+    chosen = fc.method_selected.value if fc.method_selected else method
+    console.print(Panel(
+        f"[bold]{fc.budget_name}[/bold] ({fc.budget_id})\n"
+        f"Method: [cyan]{chosen}[/cyan]"
+        + (f"  ·  MAPE: [cyan]{fc.mape:.1f}%[/cyan]" if fc.mape is not None else "")
+        + f"  ·  Confidence: [cyan]{fc.confidence:.0%}[/cyan]\n"
+        f"History: {fc.history_points} complete periods",
+        title="📈 Statistical Forecast",
+    ))
+    table = Table(title=f"Next {len(fc.points)} period(s)")
+    table.add_column("#", justify="right", style="dim")
+    table.add_column("Period", style="bold")
+    table.add_column("Predicted", justify="right")
+    table.add_column(f"{fc.interval_confidence:.0%} Interval", justify="right")
+    for p in fc.points:
+        table.add_row(
+            str(p.period_index),
+            p.period_label,
+            format_currency(p.predicted),
+            f"{format_currency(p.lower_bound)} – {format_currency(p.upper_bound)}",
+        )
+    console.print(table)
+    console.print(f"[dim]Total predicted: {format_currency(fc.total_predicted)}[/dim]")
+
+
+@predict_group.command("breaches")
+@click.option("--horizon", "-h", default=6, type=int, help="Periods to scan (default 6)")
+@click.option("--method", "-m", "method", default="auto", type=click.Choice(_METHOD_CHOICES))
+def predict_breaches(horizon, method):
+    """Predict which budgets will exceed their limits, and when."""
+    from .forecast import ForecastMethod
+    svc = get_service()
+    breaches = svc.projected_breaches(
+        horizon_periods=horizon, method=ForecastMethod(method),
+    )
+    if not breaches:
+        console.print(f"[bold green]✓ No projected breaches in the next {horizon} period(s).[/bold green]")
+        return
+    console.print(f"[bold red]⚠ {len(breaches)} projected breach(es):[/bold red]\n")
+    table = Table(title="Projected Budget Breaches")
+    table.add_column("Budget", style="bold")
+    table.add_column("Period")
+    table.add_column("Projected", justify="right")
+    table.add_column("Limit", justify="right")
+    table.add_column("Overrun", justify="right")
+    for b in breaches:
+        table.add_row(
+            b.budget_name,
+            b.period_label,
+            f"[red]{format_currency(b.projected_spend)}[/red]",
+            format_currency(b.limit),
+            f"[bold red]+{b.overrun_percent}%[/bold red]",
+        )
+    console.print(table)
+
+
+@predict_group.command("backtest")
+@click.argument("budget_id")
+@click.option("--history", default=12, type=int, help="Past periods to evaluate (default 12)")
+def predict_backtest(budget_id, history):
+    """Compare accuracy of each forecasting method on a budget's history."""
+    svc = get_service()
+    try:
+        results = svc.backtest_methods(budget_id, history_periods=history)
+    except ValueError as e:
+        console.print(f"[bold red]Error:[/bold red] {e}")
+        sys.exit(1)
+    table = Table(title="Walk-Forward Backtest Results")
+    table.add_column("Method", style="bold")
+    table.add_column("Points", justify="right")
+    table.add_column("MAPE %", justify="right")
+    table.add_column("RMSE", justify="right")
+    table.add_column("MAE", justify="right")
+    for r in results:
+        table.add_row(
+            r.method.value,
+            str(r.tested_points),
+            f"{r.mape:.2f}" if r.mape is not None else "—",
+            f"{r.rmse:.2f}" if r.rmse is not None else "—",
+            f"{r.mae:.2f}" if r.mae is not None else "—",
+        )
+    console.print(table)
+
+
+@predict_group.command("runway")
+@click.option("--months", "-m", default=6, type=int, help="Months of history to average (default 6)")
+@click.option("--currency", "-c", default="USD", help="Reporting currency")
+def predict_runway(months, currency):
+    """Cash runway: how long funds last at the observed burn rate."""
+    svc = get_service()
+    analysis = svc.analyze_runway(months=months, currency=currency)
+    status = (
+        "[bold green]Profitable — burn is covered by income[/bold green]"
+        if analysis.profitable
+        else f"[bold red]{analysis.runway_months} month(s) of runway[/bold red]"
+        + (f" — exhausts {analysis.exhaustion_date}" if analysis.exhaustion_date else "")
+    )
+    console.print(Panel(
+        f"Balance: [bold]{format_currency(analysis.balance, analysis.currency)}[/bold]"
+        f" (all-time income − expenses)\n"
+        f"Monthly income: [green]{format_currency(analysis.monthly_income, analysis.currency)}[/green]"
+        f"  ·  expenses: [red]{format_currency(analysis.monthly_expenses, analysis.currency)}[/red]\n"
+        f"Net burn: [bold]{format_currency(analysis.monthly_burn, analysis.currency)}/mo[/bold]"
+        f"  ·  trend: {analysis.burn_trend_per_month:+.2f}/mo\n"
+        f"{status}",
+        title="🛬 Cash Runway",
+    ))
+    if analysis.projection:
+        table = Table(title="Balance Projection")
+        table.add_column("Month", justify="right", style="dim")
+        table.add_column("Projected Burn", justify="right")
+        table.add_column("Projected Balance", justify="right")
+        for row in analysis.projection:
+            bal = row["projected_balance"]
+            bal_str = (
+                f"[red]{format_currency(bal, analysis.currency)}[/red]" if bal < 0
+                else format_currency(bal, analysis.currency)
+            )
+            table.add_row(str(row["month_index"]), format_currency(row["projected_burn"], analysis.currency), bal_str)
+        console.print(table)
+        console.print(f"[dim]{analysis.method_note}[/dim]")
+
+
+@predict_group.command("scenario")
+@click.option("--name", "-n", required=True, help="Scenario name")
+@click.option("--percent", "-p", type=float, default=None, help="Percent change (e.g. -20 = cut 20%%)")
+@click.option("--absolute", "-a", type=float, default=None, help="Absolute spend per period (overrides baseline)")
+@click.option("--one-off", type=float, default=None, help="One-off spike amount")
+@click.option("--one-off-period", type=int, default=1, help="Period index of the spike (default 1)")
+@click.option("--target-category", default=None, help="Only adjust budgets in this category")
+@click.option("--horizon", "-h", default=6, type=int, help="Forecast horizon in periods (default 6)")
+@click.option("--method", "-m", "method", default="auto", type=click.Choice(_METHOD_CHOICES))
+@click.option("--save", is_flag=True, help="Persist the scenario for later re-running")
+def predict_scenario(name, percent, absolute, one_off, one_off_period, target_category, horizon, method, save):
+    """Run a what-if scenario over baseline forecasts."""
+    from .forecast import ForecastMethod, Scenario, ScenarioAdjustment
+    if percent is None and absolute is None and one_off is None:
+        console.print("[bold red]Error:[/bold red] provide at least one of --percent, --absolute, --one-off")
+        sys.exit(1)
+    adj = ScenarioAdjustment(
+        target_type="category" if target_category else "all",
+        target_id=target_category,
+        percent_change=percent,
+        absolute_per_period=absolute,
+        one_off_amount=one_off,
+        one_off_period=one_off_period,
+    )
+    scenario = Scenario(
+        name=name,
+        adjustments=[adj],
+        horizon_periods=horizon,
+        method=ForecastMethod(method),
+    )
+    svc = get_service()
+    result = svc.run_scenario(scenario)
+    if save:
+        svc.save_scenario(scenario)
+
+    color = "red" if result.delta > 0 else "green"
+    console.print(Panel(
+        f"[bold]{result.scenario_name}[/bold]\n"
+        f"Baseline total: {format_currency(result.baseline_total)}"
+        f"  →  scenario: [bold]{format_currency(result.scenario_total)}[/bold]\n"
+        f"Delta: [{color}]{format_currency(result.delta)} ({result.delta_percent:+.1f}%)[/{color}]",
+        title="🔬 What-If Scenario",
+    ))
+    table = Table(title="Per-Period Comparison")
+    table.add_column("#", justify="right", style="dim")
+    table.add_column("Period", style="bold")
+    table.add_column("Baseline", justify="right")
+    table.add_column("Scenario", justify="right")
+    table.add_column("Delta", justify="right")
+    for row in result.per_period:
+        d = row["delta"]
+        table.add_row(
+            str(row["period_index"]),
+            row["period_label"],
+            format_currency(row["baseline"]),
+            format_currency(row["scenario"]),
+            f"[{'red' if d > 0 else 'green'}]{format_currency(d)}[/]",
+        )
+    console.print(table)
+    if result.projected_breaches:
+        console.print(f"[bold red]⚠ {len(result.projected_breaches)} projected breach(es) under this scenario:[/bold red]")
+        for b in result.projected_breaches:
+            console.print(
+                f"  • {b.budget_name} @ {b.period_label}: "
+                f"{format_currency(b.projected_spend)} vs {format_currency(b.limit)} "
+                f"([bold red]+{b.overrun_percent}%[/bold red])"
+            )
+    else:
+        console.print("[green]✓ No projected breaches under this scenario.[/green]")
+    if save:
+        # Print the scenario ID LAST so it's trivially parseable by agents.
+        console.print(f"[dim]Saved as {scenario.id}[/dim]")
+
+
+@predict_group.command("scenarios")
+def predict_scenarios():
+    """List saved what-if scenarios."""
+    svc = get_service()
+    scenarios = svc.list_scenarios()
+    if not scenarios:
+        console.print("[yellow]No saved scenarios.[/yellow]")
+        return
+    table = Table(title="Saved Scenarios")
+    table.add_column("ID", style="dim")
+    table.add_column("Name", style="bold")
+    table.add_column("Adjustments", justify="right")
+    table.add_column("Horizon", justify="right")
+    for s in scenarios:
+        table.add_row(s.id, s.name, str(len(s.adjustments)), f"{s.horizon_periods}p")
+    console.print(table)
+
+
+@predict_group.command("run-saved")
+@click.argument("scenario_id")
+def predict_run_saved(scenario_id):
+    """Re-run a saved scenario against current data."""
+    svc = get_service()
+    try:
+        result = svc.run_saved_scenario(scenario_id)
+    except ValueError as e:
+        console.print(f"[bold red]Error:[/bold red] {e}")
+        sys.exit(1)
+    color = "red" if result.delta > 0 else "green"
+    console.print(
+        f"[bold]{result.scenario_name}[/bold]: baseline {format_currency(result.baseline_total)} "
+        f"→ scenario {format_currency(result.scenario_total)} "
+        f"([{color}]{result.delta_percent:+.1f}%[/{color}]), "
+        f"{len(result.projected_breaches)} projected breach(es)"
+    )
+
+
+@predict_group.command("delete-scenario")
+@click.argument("scenario_id")
+def predict_delete_scenario(scenario_id):
+    """Delete a saved scenario."""
+    svc = get_service()
+    if svc.delete_scenario(scenario_id):
+        console.print(f"[bold green]✓ Deleted {scenario_id}[/bold green]")
+    else:
+        console.print(f"[bold red]Not found: {scenario_id}[/bold red]")
+        sys.exit(1)
+
+
 if __name__ == "__main__":
     main()

@@ -123,6 +123,19 @@ Stop runaway LLM costs before they happen. Agent Budget is an MCP server + CLI t
 - **Rate change history** — Automatic snapshots on rate overwrite; manual snapshots for periodic monitoring
 - **CLI support** — `agent-budget fx set|get|list|delete|convert|summary|snapshot|history|drift|clear-history`
 
+### 🔮 Statistical Forecasting & Scenario Engine (v0.14.0)
+- **Real time-series methods** — Moving average, Holt's linear trend (damped), and additive Holt-Winters with seasonality
+- **Auto method selection** — Walk-forward backtesting picks the lowest-MAPE method per budget
+- **Prediction intervals** — Residual-derived bands that widen with √horizon, at 50–99% confidence
+- **Projected breach scan** — Predict which budgets exceed their limits and exactly when, before it happens
+- **What-if scenarios** — Scale spend ±%, override absolute amounts, inject one-off spikes; target all/category/budget
+- **Saved scenarios** — Persist and re-run scenarios against live data; ad-hoc runs supported too
+- **Cash runway analysis** — All-time balance vs. linear-trend monthly burn; exhaustion date + month-by-month projection
+- **Multi-currency aware** — History and forecasts computed in the budget's own currency via the FX engine
+- **Partial-period safety** — The current in-progress period is excluded from history so it can't skew estimates
+- **9 new MCP tools** — `forecast_budget`, `forecast_all_budgets`, `get_projected_breaches`, `backtest_forecast_methods`, `run_what_if_scenario`, `analyze_cash_runway`, `list_scenarios`, `run_saved_scenario`, `delete_scenario`
+- **CLI** — `agent-budget predict forecast|backtest|breaches|runway|scenario|scenarios|run-saved|delete-scenario`
+
 ### 📊 Budget Management (v0.1.0–v0.4.0)
 - **Budget tracking** — Create budgets with limits, periods, categories, rollover
 - **Expense tracking** — Log expenses with categories, tags, vendor info, receipts
@@ -251,6 +264,17 @@ mcp.run()
 | `create_loop_config` | Configure loop detection parameters |
 | `list_loop_configs` | List loop detection configs |
 | `delete_loop_config` | Delete a loop detection config |
+
+### Statistical Forecasting & Scenarios (v0.14.0)
+| Tool | Description |
+|------|-------------|
+| `forecast_budget` | **Statistical forecast** for one budget with prediction intervals |
+| `forecast_all_budgets` | Forecasts for every active budget |
+| `get_projected_breaches` | **Predict limit breaches** and when they'll happen |
+| `backtest_forecast_methods` | Compare walk-forward accuracy of each method |
+| `run_what_if_scenario` | **What-if analysis** — scale, override, or spike spend |
+| `analyze_cash_runway` | Months of funds left at the observed burn rate |
+| `list_scenarios` / `run_saved_scenario` / `delete_scenario` | Saved scenario management |
 
 ### Model Cost Optimizer (v0.11.0)
 | Tool | Description |
@@ -417,7 +441,7 @@ USD, EUR, GBP, JPY, CAD, AUD, CHF, CNY, INR, BRL, KRW, MXN, SGD, SEK, NZD
 ## Testing
 
 ```bash
-# Run all 677 tests
+# Run all 914 tests
 uv venv .venv
 VIRTUAL_ENV=$(pwd)/.venv uv pip install -e ".[dev]"
 .venv/bin/python -m pytest -q
